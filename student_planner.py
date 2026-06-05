@@ -1,12 +1,32 @@
-"""학생 자율주차 알고리즘 스켈레톤 모듈.
+"""Student parking planner.
 
-이 파일만 수정하면 되고, 네트워킹/IPC 관련 코드는 `ipc_client.py`에서
-자동으로 처리합니다. 학생은 아래 `PlannerSkeleton` 클래스나 `planner_step`
-함수를 원하는 로직으로 교체/확장하면 됩니다.
+Only this file is intended to be edited by students. The simulator sends a
+static map once, then sends observation packets every tick. `planner_step`
+returns the command dictionary expected by the provided IPC client:
+
+    {"steer": radians, "accel": 0..1, "brake": 0..1, "gear": "D" or "R"}
+
+This implementation is a minimum working baseline:
+- A* plans a collision-aware path from the current vehicle position to an
+  approach point near the target parking slot.
+- A short final segment moves into the slot center with the desired yaw.
+- Pure Pursuit tracks the waypoint path.
+- Simple proportional speed control slows near the slot, obstacles, and sharp
+  turns.
 """
 
+from __future__ import annotations
+
+import heapq
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+
+from rl_speed_controller import RLSpeedController
+
+
+Waypoint = Tuple[float, float, float, str]  # x, y, desired yaw, gear
+USE_RL_SPEED_CONTROL = True
 
 
 def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
@@ -25,20 +45,28 @@ def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
 
 @dataclass
 class PlannerSkeleton:
-    """경로 계획/제어 로직을 담는 기본 스켈레톤 클래스입니다."""
+    """Rule-based planner and controller fitted to the existing simulator API."""
 
     map_data: Optional[Dict[str, Any]] = None
     map_extent: Optional[Tuple[float, float, float, float]] = None
     cell_size: float = 0.5
     stationary_grid: Optional[List[List[float]]] = None
-    waypoints: List[Tuple[float, float]] = None
+    waypoints: List[Waypoint] = None
+    waypoint_index: int = 0
+    target_signature: Optional[Tuple[float, ...]] = None
+    last_log_time: float = -999.0
+    step_count: int = 0
+    min_obstacle_distance: float = float("inf")
+    rl_speed: RLSpeedController = None
 
     def __post_init__(self) -> None:
         if self.waypoints is None:
             self.waypoints = []
+        if self.rl_speed is None:
+            self.rl_speed = RLSpeedController(enabled=USE_RL_SPEED_CONTROL)
 
     def set_map(self, map_payload: Dict[str, Any]) -> None:
-        """시뮬레이터에서 전송한 정적 맵 데이터를 보관합니다."""
+        """Store static map data sent by the simulator."""
 
         self.map_data = map_payload
         self.map_extent = tuple(
@@ -48,50 +76,427 @@ class PlannerSkeleton:
         self.stationary_grid = map_payload.get("grid", {}).get("stationary")
         pretty_print_map_summary(map_payload)
         self.waypoints.clear()
+        self.waypoint_index = 0
+        self.target_signature = None
+        self.last_log_time = -999.0
+        self.step_count = 0
+        self.min_obstacle_distance = float("inf")
+        self.rl_speed = RLSpeedController(enabled=USE_RL_SPEED_CONTROL)
 
     def compute_path(self, obs: Dict[str, Any]) -> None:
-        """관측과 맵을 이용해 경로(웨이포인트)를 준비합니다."""
+        """Plan a path from the current pose to the target parking slot."""
 
-        # TODO: A*, RRT*, Hybrid A* 등으로 self.waypoints를 채우세요.
         self.waypoints.clear()
+        self.waypoint_index = 0
+        state = obs.get("state", {})
+        start = (
+            float(state.get("x", 0.0)),
+            float(state.get("y", 0.0)),
+            float(state.get("yaw", 0.0)),
+        )
+        slot = obs.get("target_slot") or []
+        if len(slot) != 4 or self.map_extent is None:
+            print("[algo] planning failed: missing target slot or map")
+            return
 
-    def compute_control(self, obs: Dict[str, Any]) -> Dict[str, float]:
-        """경로를 따라가기 위한 조향/가감속 명령을 산출합니다."""
+        self.target_signature = tuple(round(float(v), 3) for v in slot)
+        target_pose = self._target_pose(slot)
+        approach_pose = self._approach_pose(slot, target_pose[2])
 
-        # 예시: 기본 데모 제어. 학생은 원하는 알고리즘으로 대체하면 됩니다.
-        t = float(obs.get("t", 0.0))
-        v = float(obs.get("state", {}).get("v", 0.0))
-
-        cmd = {"steer": 0.0, "accel": 0.0, "brake": 0.0, "gear": "D"}
-
-        if t < 2.0:
-            cmd["accel"] = 0.6
-        elif t < 3.0:
-            cmd["brake"] = 0.3
+        grid_path = self._astar_path((start[0], start[1]), (approach_pose[0], approach_pose[1]))
+        if not grid_path:
+            print("[algo] planning fallback: A* failed, using direct approach path")
+            grid_path = [(start[0], start[1]), (approach_pose[0], approach_pose[1])]
         else:
-            cmd["steer"] = 0.07
-            if v < 1.0:
-                cmd["accel"] = 0.2
+            print(f"[algo] planning success: {len(grid_path)} A* points")
 
-        return cmd
+        simplified = self._simplify_path(grid_path, spacing=1.0)
+        points = simplified + [(target_pose[0], target_pose[1])]
+        self.waypoints = self._points_to_waypoints(points, final_yaw=target_pose[2], gear="D")
+
+        initial_clearance = self._estimate_min_obstacle_distance((start[0], start[1]))
+        self.min_obstacle_distance = min(self.min_obstacle_distance, initial_clearance)
+        print(
+            "[algo] path ready:"
+            f" waypoints={len(self.waypoints)}"
+            f" target=({target_pose[0]:.2f}, {target_pose[1]:.2f}, "
+            f"yaw={math.degrees(target_pose[2]):.1f}deg)"
+            f" min_obstacle_dist~{initial_clearance:.2f}m"
+        )
+
+    def compute_control(self, obs: Dict[str, Any]) -> Dict[str, Any]:
+        """Return steering, acceleration, brake, and gear for one simulation tick."""
+
+        self.step_count += 1
+        state = obs.get("state", {})
+        x = float(state.get("x", 0.0))
+        y = float(state.get("y", 0.0))
+        yaw = float(state.get("yaw", 0.0))
+        speed = abs(float(state.get("v", 0.0)))
+        t = float(obs.get("t", 0.0))
+        limits = obs.get("limits", {})
+        wheelbase = float(limits.get("L", 2.6))
+        max_steer = float(limits.get("maxSteer", math.radians(35.0)))
+
+        slot = obs.get("target_slot") or []
+        signature = tuple(round(float(v), 3) for v in slot) if len(slot) == 4 else None
+        if not self.waypoints or signature != self.target_signature:
+            self.compute_path(obs)
+
+        if not self.waypoints:
+            return {"steer": 0.0, "accel": 0.0, "brake": 0.8, "gear": "D"}
+
+        final_wp = self.waypoints[-1]
+        final_dist = math.hypot(final_wp[0] - x, final_wp[1] - y)
+        final_yaw_error = abs(self._wrap_to_pi(final_wp[2] - yaw))
+        obstacle_dist = self._estimate_min_obstacle_distance((x, y))
+        self.min_obstacle_distance = min(self.min_obstacle_distance, obstacle_dist)
+
+        if final_dist < 0.55 and final_yaw_error < math.radians(14.0):
+            if speed < 0.18:
+                print(
+                    "[algo] parking succeeded:"
+                    f" pos_error={final_dist:.2f}m"
+                    f" yaw_error={math.degrees(final_yaw_error):.1f}deg"
+                    f" steps={self.step_count}"
+                    f" min_obstacle_dist~{self.min_obstacle_distance:.2f}m"
+                )
+            return {"steer": 0.0, "accel": 0.0, "brake": 1.0, "gear": "D"}
+
+        self._advance_waypoint_index(x, y)
+        lookahead = 1.1 + 0.35 * min(speed, 3.0)
+        target_idx = self._lookahead_index(x, y, lookahead=lookahead)
+        target_wp = self.waypoints[target_idx]
+        gear = target_wp[3]
+
+        steer = self._pure_pursuit_steer(
+            x=x,
+            y=y,
+            yaw=yaw,
+            target_x=target_wp[0],
+            target_y=target_wp[1],
+            wheelbase=wheelbase,
+            max_steer=max_steer,
+            reverse=(gear == "R"),
+        )
+
+        rule_speed = self._target_speed(final_dist, final_yaw_error, steer, obstacle_dist)
+        target_speed = self.rl_speed.adjust_target_speed(
+            rule_speed=rule_speed,
+            final_dist=final_dist,
+            yaw_error=final_yaw_error,
+            steer_abs=abs(steer),
+            obstacle_dist=obstacle_dist,
+        )
+        accel, brake = self._speed_command(speed=speed, target_speed=target_speed)
+
+        if t - self.last_log_time > 2.0:
+            self.last_log_time = t
+            print(
+                "[algo] tracking:"
+                f" wp={self.waypoint_index}/{len(self.waypoints) - 1}"
+                f" pos_error={final_dist:.2f}m"
+                f" yaw_error={math.degrees(final_yaw_error):.1f}deg"
+                f" min_obstacle_dist~{self.min_obstacle_distance:.2f}m"
+                f" speed={target_speed:.2f}m/s"
+                f" rl_state={self.rl_speed.last_state}"
+            )
+
+        return {"steer": steer, "accel": accel, "brake": brake, "gear": gear}
+
+    def _target_pose(self, slot: List[float]) -> Tuple[float, float, float]:
+        cx = 0.5 * (float(slot[0]) + float(slot[1]))
+        cy = 0.5 * (float(slot[2]) + float(slot[3]))
+        expected = str((self.map_data or {}).get("expected_orientation") or "")
+        yaw = -math.pi / 2.0 if expected.lower().startswith("rear") else math.pi / 2.0
+        return cx, cy, yaw
+
+    def _approach_pose(self, slot: List[float], target_yaw: float) -> Tuple[float, float, float]:
+        cx = 0.5 * (float(slot[0]) + float(slot[1]))
+        cy = 0.5 * (float(slot[2]) + float(slot[3]))
+        slot_len = abs(float(slot[3]) - float(slot[2]))
+        offset = max(2.5, slot_len * 0.75)
+        return cx - math.cos(target_yaw) * offset, cy - math.sin(target_yaw) * offset, target_yaw
+
+    def _astar_path(
+        self,
+        start_xy: Tuple[float, float],
+        goal_xy: Tuple[float, float],
+    ) -> List[Tuple[float, float]]:
+        if self.map_extent is None:
+            return []
+        xmin, xmax, ymin, ymax = self.map_extent
+        grid_step = max(self.cell_size, 0.5)
+        cols = max(1, int(math.ceil((xmax - xmin) / grid_step)))
+        rows = max(1, int(math.ceil((ymax - ymin) / grid_step)))
+        blocked = self._build_blocked_grid(rows, cols, grid_step)
+
+        def to_cell(point: Tuple[float, float]) -> Tuple[int, int]:
+            px, py = point
+            col = int((px - xmin) / grid_step)
+            row = int((ymax - py) / grid_step)
+            return max(0, min(rows - 1, row)), max(0, min(cols - 1, col))
+
+        def to_world(cell: Tuple[int, int]) -> Tuple[float, float]:
+            row, col = cell
+            return xmin + (col + 0.5) * grid_step, ymax - (row + 0.5) * grid_step
+
+        start = to_cell(start_xy)
+        goal = to_cell(goal_xy)
+        self._clear_cell(blocked, start, radius=2)
+        self._clear_cell(blocked, goal, radius=3)
+
+        open_heap: List[Tuple[float, float, Tuple[int, int]]] = []
+        heapq.heappush(open_heap, (0.0, 0.0, start))
+        came_from: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        cost_so_far: Dict[Tuple[int, int], float] = {start: 0.0}
+        motions = [
+            (-1, 0, 1.0),
+            (1, 0, 1.0),
+            (0, -1, 1.0),
+            (0, 1, 1.0),
+            (-1, -1, 1.414),
+            (-1, 1, 1.414),
+            (1, -1, 1.414),
+            (1, 1, 1.414),
+        ]
+
+        while open_heap:
+            _, _, current = heapq.heappop(open_heap)
+            if current == goal:
+                break
+            for dr, dc, move_cost in motions:
+                nxt = (current[0] + dr, current[1] + dc)
+                if not (0 <= nxt[0] < rows and 0 <= nxt[1] < cols):
+                    continue
+                if blocked[nxt[0]][nxt[1]]:
+                    continue
+                new_cost = cost_so_far[current] + move_cost
+                if new_cost >= cost_so_far.get(nxt, float("inf")):
+                    continue
+                cost_so_far[nxt] = new_cost
+                heuristic = math.hypot(goal[0] - nxt[0], goal[1] - nxt[1])
+                heapq.heappush(open_heap, (new_cost + heuristic, new_cost, nxt))
+                came_from[nxt] = current
+
+        if goal not in came_from and goal != start:
+            return []
+
+        cells = [goal]
+        while cells[-1] != start:
+            cells.append(came_from[cells[-1]])
+        cells.reverse()
+        path = [start_xy]
+        path.extend(to_world(cell) for cell in cells[1:-1])
+        path.append(goal_xy)
+        return path
+
+    def _build_blocked_grid(self, rows: int, cols: int, grid_step: float) -> List[List[bool]]:
+        blocked = [[False for _ in range(cols)] for _ in range(rows)]
+        if self.map_extent is None:
+            return blocked
+        xmin, _, _, ymax = self.map_extent
+
+        for rect in self._obstacle_rects():
+            self._mark_rect(blocked, rect, grid_step, margin=0.35)
+        # The stationary grid is useful for later scoring/cost tuning, but as a
+        # hard obstacle it closes many center-line A* corridors in this map.
+        # Keep the baseline explainable: hard-block occupied slots and walls.
+        return self._inflate_blocked(blocked, radius_cells=0)
+
+    def _obstacle_rects(self) -> List[Tuple[float, float, float, float]]:
+        rects: List[Tuple[float, float, float, float]] = []
+        if not self.map_data:
+            return rects
+        slots = self.map_data.get("slots") or []
+        occupied = self.map_data.get("occupied_idx") or []
+        for idx, slot in enumerate(slots):
+            if idx < len(occupied) and bool(occupied[idx]):
+                rects.append(tuple(float(v) for v in slot))
+        for rect in self.map_data.get("walls_rects") or []:
+            rects.append(tuple(float(v) for v in rect))
+        return rects
+
+    def _mark_rect(
+        self,
+        blocked: List[List[bool]],
+        rect: Tuple[float, float, float, float],
+        grid_step: float,
+        margin: float,
+    ) -> None:
+        if self.map_extent is None:
+            return
+        xmin, _, _, ymax = self.map_extent
+        rows = len(blocked)
+        cols = len(blocked[0]) if rows else 0
+        rx0, rx1, ry0, ry1 = rect
+        rx0 -= margin
+        rx1 += margin
+        ry0 -= margin
+        ry1 += margin
+        c0 = max(0, int((rx0 - xmin) / grid_step))
+        c1 = min(cols - 1, int((rx1 - xmin) / grid_step))
+        r0 = max(0, int((ymax - ry1) / grid_step))
+        r1 = min(rows - 1, int((ymax - ry0) / grid_step))
+        for row in range(r0, r1 + 1):
+            for col in range(c0, c1 + 1):
+                blocked[row][col] = True
+
+    def _inflate_blocked(self, blocked: List[List[bool]], radius_cells: int) -> List[List[bool]]:
+        rows = len(blocked)
+        cols = len(blocked[0]) if rows else 0
+        inflated = [row[:] for row in blocked]
+        for row in range(rows):
+            for col in range(cols):
+                if not blocked[row][col]:
+                    continue
+                for dr in range(-radius_cells, radius_cells + 1):
+                    for dc in range(-radius_cells, radius_cells + 1):
+                        rr = row + dr
+                        cc = col + dc
+                        if 0 <= rr < rows and 0 <= cc < cols:
+                            inflated[rr][cc] = True
+        return inflated
+
+    def _clear_cell(self, blocked: List[List[bool]], cell: Tuple[int, int], radius: int) -> None:
+        rows = len(blocked)
+        cols = len(blocked[0]) if rows else 0
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                rr = cell[0] + dr
+                cc = cell[1] + dc
+                if 0 <= rr < rows and 0 <= cc < cols:
+                    blocked[rr][cc] = False
+
+    def _simplify_path(
+        self,
+        path: List[Tuple[float, float]],
+        spacing: float,
+    ) -> List[Tuple[float, float]]:
+        if len(path) <= 2:
+            return path
+        simplified = [path[0]]
+        last = path[0]
+        for point in path[1:-1]:
+            if math.hypot(point[0] - last[0], point[1] - last[1]) >= spacing:
+                simplified.append(point)
+                last = point
+        simplified.append(path[-1])
+        return simplified
+
+    def _points_to_waypoints(
+        self,
+        points: List[Tuple[float, float]],
+        final_yaw: float,
+        gear: str,
+    ) -> List[Waypoint]:
+        waypoints: List[Waypoint] = []
+        for idx, point in enumerate(points):
+            if idx < len(points) - 1:
+                nxt = points[idx + 1]
+                yaw = math.atan2(nxt[1] - point[1], nxt[0] - point[0])
+            else:
+                yaw = final_yaw
+            waypoints.append((point[0], point[1], yaw, gear))
+        return waypoints
+
+    def _advance_waypoint_index(self, x: float, y: float) -> None:
+        while self.waypoint_index < len(self.waypoints) - 1:
+            wp = self.waypoints[self.waypoint_index]
+            if math.hypot(wp[0] - x, wp[1] - y) > 0.8:
+                break
+            self.waypoint_index += 1
+
+    def _lookahead_index(self, x: float, y: float, lookahead: float) -> int:
+        idx = self.waypoint_index
+        while idx < len(self.waypoints) - 1:
+            wp = self.waypoints[idx]
+            if math.hypot(wp[0] - x, wp[1] - y) >= lookahead:
+                return idx
+            idx += 1
+        return len(self.waypoints) - 1
+
+    def _pure_pursuit_steer(
+        self,
+        x: float,
+        y: float,
+        yaw: float,
+        target_x: float,
+        target_y: float,
+        wheelbase: float,
+        max_steer: float,
+        reverse: bool,
+    ) -> float:
+        dx = target_x - x
+        dy = target_y - y
+        tracking_yaw = self._wrap_to_pi(yaw + math.pi) if reverse else yaw
+        local_x = math.cos(tracking_yaw) * dx + math.sin(tracking_yaw) * dy
+        local_y = -math.sin(tracking_yaw) * dx + math.cos(tracking_yaw) * dy
+        lookahead = max(0.5, math.hypot(local_x, local_y))
+        alpha = math.atan2(local_y, local_x)
+        steer = math.atan2(2.0 * wheelbase * math.sin(alpha), lookahead)
+        if reverse:
+            steer = -steer
+        return max(-max_steer, min(max_steer, steer))
+
+    def _target_speed(
+        self,
+        final_dist: float,
+        yaw_error: float,
+        steer: float,
+        obstacle_dist: float,
+    ) -> float:
+        target = 1.25
+        if final_dist < 6.0:
+            target = 0.75
+        if final_dist < 2.2:
+            target = 0.38
+        if yaw_error > math.radians(35.0) or abs(steer) > math.radians(25.0):
+            target = min(target, 0.55)
+        if obstacle_dist < 1.4:
+            target = min(target, 0.35)
+        return target
+
+    def _speed_command(self, speed: float, target_speed: float) -> Tuple[float, float]:
+        error = target_speed - speed
+        if error > 0.15:
+            return min(0.45, 0.18 + 0.25 * error), 0.0
+        if error < -0.08:
+            return 0.0, min(0.8, 0.25 + 0.35 * (-error))
+        return 0.0, 0.0
+
+    def _estimate_min_obstacle_distance(self, point: Tuple[float, float]) -> float:
+        px, py = point
+        best = float("inf")
+        for rx0, rx1, ry0, ry1 in self._obstacle_rects():
+            dx = max(rx0 - px, 0.0, px - rx1)
+            dy = max(ry0 - py, 0.0, py - ry1)
+            best = min(best, math.hypot(dx, dy))
+        return best
+
+    @staticmethod
+    def _wrap_to_pi(angle: float) -> float:
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
 
 
-# 전역 planner 인스턴스 (통신 모듈이 이 객체를 사용합니다.)
 planner = PlannerSkeleton()
 
 
 def handle_map_payload(map_payload: Dict[str, Any]) -> None:
-    """통신 모듈에서 맵 패킷을 받을 때 호출됩니다."""
+    """Called by ipc_client.py when the simulator sends the static map."""
 
     planner.set_map(map_payload)
 
 
 def planner_step(obs: Dict[str, Any]) -> Dict[str, Any]:
-    """통신 모듈에서 매 스텝 호출하여 명령을 생성합니다."""
+    """Called by ipc_client.py every simulation tick."""
 
     try:
         return planner.compute_control(obs)
     except Exception as exc:
         print(f"[algo] planner_step error: {exc}")
-        return {"steer": 0.0, "accel": 0.0, "brake": 0.5, "gear": "D"}
-
+        return {"steer": 0.0, "accel": 0.0, "brake": 0.8, "gear": "D"}
