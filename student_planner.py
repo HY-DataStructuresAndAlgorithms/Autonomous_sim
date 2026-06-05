@@ -18,7 +18,9 @@ This implementation is a minimum working baseline:
 from __future__ import annotations
 
 import heapq
+import json
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -26,7 +28,12 @@ from rl_speed_controller import RLSpeedController
 
 
 Waypoint = Tuple[float, float, float, str]  # x, y, desired yaw, gear
-USE_RL_SPEED_CONTROL = True
+USE_RL_SPEED_CONTROL = os.getenv("PARKING_USE_RL_SPEED", "1").lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
 
 
 def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
@@ -58,6 +65,9 @@ class PlannerSkeleton:
     step_count: int = 0
     min_obstacle_distance: float = float("inf")
     rl_speed: RLSpeedController = None
+    last_eval_log_time: float = -999.0
+    final_eval_logged: bool = False
+    planning_fail_reason: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.waypoints is None:
@@ -81,7 +91,11 @@ class PlannerSkeleton:
         self.last_log_time = -999.0
         self.step_count = 0
         self.min_obstacle_distance = float("inf")
+        self.last_eval_log_time = -999.0
+        self.final_eval_logged = False
+        self.planning_fail_reason = None
         self.rl_speed = RLSpeedController(enabled=USE_RL_SPEED_CONTROL)
+        print(f"[algo] rl_speed_control={'ON' if USE_RL_SPEED_CONTROL else 'OFF'}")
 
     def compute_path(self, obs: Dict[str, Any]) -> None:
         """Plan a path from the current pose to the target parking slot."""
@@ -96,22 +110,32 @@ class PlannerSkeleton:
         )
         slot = obs.get("target_slot") or []
         if len(slot) != 4 or self.map_extent is None:
+            self.planning_fail_reason = "missing_target_or_map"
             print("[algo] planning failed: missing target slot or map")
             return
 
         self.target_signature = tuple(round(float(v), 3) for v in slot)
         target_pose = self._target_pose(slot)
-        approach_pose = self._approach_pose(slot, target_pose[2])
+        candidates = self._approach_candidates(slot, target_pose[2])
+        best_plan = self._select_best_plan((start[0], start[1]), candidates, target_pose)
 
-        grid_path = self._astar_path((start[0], start[1]), (approach_pose[0], approach_pose[1]))
-        if not grid_path:
+        if best_plan is None:
+            self.planning_fail_reason = "all_approach_candidates_failed"
             print("[algo] planning fallback: A* failed, using direct approach path")
+            approach_pose = candidates[0]
             grid_path = [(start[0], start[1]), (approach_pose[0], approach_pose[1])]
         else:
-            print(f"[algo] planning success: {len(grid_path)} A* points")
+            self.planning_fail_reason = None
+            approach_pose, grid_path, cost = best_plan
+            print(
+                "[algo] planning success:"
+                f" candidates={len(candidates)}"
+                f" selected=({approach_pose[0]:.2f}, {approach_pose[1]:.2f})"
+                f" a_star_points={len(grid_path)} cost={cost:.2f}"
+            )
 
         simplified = self._simplify_path(grid_path, spacing=1.0)
-        points = simplified + [(target_pose[0], target_pose[1])]
+        points = self._append_final_alignment(simplified, target_pose)
         self.waypoints = self._points_to_waypoints(points, final_yaw=target_pose[2], gear="D")
 
         initial_clearance = self._estimate_min_obstacle_distance((start[0], start[1]))
@@ -152,7 +176,17 @@ class PlannerSkeleton:
         obstacle_dist = self._estimate_min_obstacle_distance((x, y))
         self.min_obstacle_distance = min(self.min_obstacle_distance, obstacle_dist)
 
+        collision_risk = obstacle_dist < 0.08
+
         if final_dist < 0.55 and final_yaw_error < math.radians(14.0):
+            self._log_evaluation(
+                parking_success=True,
+                fail_reason="none",
+                final_position_error=final_dist,
+                final_yaw_error=final_yaw_error,
+                collision=collision_risk,
+                force=True,
+            )
             if speed < 0.18:
                 print(
                     "[algo] parking succeeded:"
@@ -164,7 +198,7 @@ class PlannerSkeleton:
             return {"steer": 0.0, "accel": 0.0, "brake": 1.0, "gear": "D"}
 
         self._advance_waypoint_index(x, y)
-        lookahead = 1.1 + 0.35 * min(speed, 3.0)
+        lookahead = self._adaptive_lookahead(speed, final_dist, final_yaw_error)
         target_idx = self._lookahead_index(x, y, lookahead=lookahead)
         target_wp = self.waypoints[target_idx]
         gear = target_wp[3]
@@ -189,6 +223,14 @@ class PlannerSkeleton:
             obstacle_dist=obstacle_dist,
         )
         accel, brake = self._speed_command(speed=speed, target_speed=target_speed)
+        self._log_evaluation(
+            parking_success=False,
+            fail_reason="collision_risk" if collision_risk else self.planning_fail_reason or "running",
+            final_position_error=final_dist,
+            final_yaw_error=final_yaw_error,
+            collision=collision_risk,
+            current_time=t,
+        )
 
         if t - self.last_log_time > 2.0:
             self.last_log_time = t
@@ -198,8 +240,12 @@ class PlannerSkeleton:
                 f" pos_error={final_dist:.2f}m"
                 f" yaw_error={math.degrees(final_yaw_error):.1f}deg"
                 f" min_obstacle_dist~{self.min_obstacle_distance:.2f}m"
+                f" lookahead={lookahead:.2f}m"
+                f" rule_speed={rule_speed:.2f}m/s"
                 f" speed={target_speed:.2f}m/s"
+                f" rl={'ON' if self.rl_speed.enabled else 'OFF'}"
                 f" rl_state={self.rl_speed.last_state}"
+                f" rl_action={self.rl_speed.last_action}"
             )
 
         return {"steer": steer, "accel": accel, "brake": brake, "gear": gear}
@@ -217,6 +263,66 @@ class PlannerSkeleton:
         slot_len = abs(float(slot[3]) - float(slot[2]))
         offset = max(2.5, slot_len * 0.75)
         return cx - math.cos(target_yaw) * offset, cy - math.sin(target_yaw) * offset, target_yaw
+
+    def _approach_candidates(
+        self,
+        slot: List[float],
+        target_yaw: float,
+    ) -> List[Tuple[float, float, float]]:
+        cx = 0.5 * (float(slot[0]) + float(slot[1]))
+        cy = 0.5 * (float(slot[2]) + float(slot[3]))
+        slot_w = abs(float(slot[1]) - float(slot[0]))
+        slot_l = abs(float(slot[3]) - float(slot[2]))
+        forward = (math.cos(target_yaw), math.sin(target_yaw))
+        lateral = (-math.sin(target_yaw), math.cos(target_yaw))
+        distances = [max(2.6, slot_l * 0.75), max(3.6, slot_l), max(4.8, slot_l * 1.25)]
+        lateral_offsets = [0.0, 0.35 * slot_w, -0.35 * slot_w, 0.70 * slot_w, -0.70 * slot_w]
+        candidates: List[Tuple[float, float, float]] = []
+        for distance in distances:
+            for lateral_offset in lateral_offsets:
+                ax = cx - forward[0] * distance + lateral[0] * lateral_offset
+                ay = cy - forward[1] * distance + lateral[1] * lateral_offset
+                if self._inside_map(ax, ay):
+                    candidates.append((ax, ay, target_yaw))
+        return candidates or [self._approach_pose(slot, target_yaw)]
+
+    def _select_best_plan(
+        self,
+        start_xy: Tuple[float, float],
+        candidates: List[Tuple[float, float, float]],
+        target_pose: Tuple[float, float, float],
+    ) -> Optional[Tuple[Tuple[float, float, float], List[Tuple[float, float]], float]]:
+        best: Optional[Tuple[Tuple[float, float, float], List[Tuple[float, float]], float]] = None
+        for candidate in candidates:
+            grid_path = self._astar_path(start_xy, (candidate[0], candidate[1]))
+            if not grid_path:
+                continue
+            path_len = self._path_length(grid_path)
+            clearance = self._estimate_min_obstacle_distance((candidate[0], candidate[1]))
+            final_leg = math.hypot(target_pose[0] - candidate[0], target_pose[1] - candidate[1])
+            yaw_align = abs(self._wrap_to_pi(candidate[2] - target_pose[2]))
+            clearance_penalty = 4.0 / max(clearance, 0.25)
+            cost = path_len + 0.65 * final_leg + 2.0 * yaw_align + clearance_penalty
+            if best is None or cost < best[2]:
+                best = (candidate, grid_path, cost)
+        return best
+
+    def _append_final_alignment(
+        self,
+        approach_path: List[Tuple[float, float]],
+        target_pose: Tuple[float, float, float],
+    ) -> List[Tuple[float, float]]:
+        if not approach_path:
+            return [(target_pose[0], target_pose[1])]
+        points = list(approach_path)
+        tx, ty, target_yaw = target_pose
+        forward = (math.cos(target_yaw), math.sin(target_yaw))
+        alignment_distances = [2.2, 1.2, 0.45, 0.0]
+        for distance in alignment_distances:
+            point = (tx - forward[0] * distance, ty - forward[1] * distance)
+            if math.hypot(point[0] - points[-1][0], point[1] - points[-1][1]) > 0.25:
+                points.append(point)
+        return points
 
     def _astar_path(
         self,
@@ -416,6 +522,16 @@ class PlannerSkeleton:
             idx += 1
         return len(self.waypoints) - 1
 
+    def _adaptive_lookahead(self, speed: float, final_dist: float, yaw_error: float) -> float:
+        lookahead = 1.05 + 0.35 * min(speed, 3.0)
+        if final_dist < 6.0:
+            lookahead = min(lookahead, 0.95)
+        if final_dist < 2.5:
+            lookahead = min(lookahead, 0.65)
+        if yaw_error > math.radians(35.0):
+            lookahead = min(lookahead, 0.75)
+        return max(0.45, lookahead)
+
     def _pure_pursuit_steer(
         self,
         x: float,
@@ -457,6 +573,20 @@ class PlannerSkeleton:
             target = min(target, 0.35)
         return target
 
+    def _inside_map(self, x: float, y: float, margin: float = 0.4) -> bool:
+        if self.map_extent is None:
+            return True
+        xmin, xmax, ymin, ymax = self.map_extent
+        return xmin + margin <= x <= xmax - margin and ymin + margin <= y <= ymax - margin
+
+    def _path_length(self, path: List[Tuple[float, float]]) -> float:
+        if len(path) < 2:
+            return 0.0
+        return sum(
+            math.hypot(path[i][0] - path[i - 1][0], path[i][1] - path[i - 1][1])
+            for i in range(1, len(path))
+        )
+
     def _speed_command(self, speed: float, target_speed: float) -> Tuple[float, float]:
         error = target_speed - speed
         if error > 0.15:
@@ -473,6 +603,40 @@ class PlannerSkeleton:
             dy = max(ry0 - py, 0.0, py - ry1)
             best = min(best, math.hypot(dx, dy))
         return best
+
+    def _log_evaluation(
+        self,
+        parking_success: bool,
+        fail_reason: str,
+        final_position_error: float,
+        final_yaw_error: float,
+        collision: bool,
+        current_time: Optional[float] = None,
+        force: bool = False,
+    ) -> None:
+        if parking_success and self.final_eval_logged:
+            return
+        if not force and current_time is not None and current_time - self.last_eval_log_time < 5.0:
+            return
+        if parking_success:
+            self.final_eval_logged = True
+        if current_time is not None:
+            self.last_eval_log_time = current_time
+        payload = {
+            "parking_success": bool(parking_success),
+            "fail_reason": fail_reason,
+            "final_position_error": round(float(final_position_error), 3),
+            "final_yaw_error": round(math.degrees(float(final_yaw_error)), 2),
+            "min_obstacle_distance": (
+                None
+                if math.isinf(self.min_obstacle_distance)
+                else round(float(self.min_obstacle_distance), 3)
+            ),
+            "collision": bool(collision),
+            "step_count": int(self.step_count),
+            "rl_speed_control": "ON" if self.rl_speed and self.rl_speed.enabled else "OFF",
+        }
+        print("[eval] " + json.dumps(payload, sort_keys=True))
 
     @staticmethod
     def _wrap_to_pi(angle: float) -> float:
