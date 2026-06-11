@@ -422,6 +422,8 @@ class PlannerSkeleton:
 
         for rect in self._obstacle_rects():
             self._mark_rect(blocked, rect, grid_step, margin=0.35)
+        for rect in self._line_obstacle_rects(half_width=0.08):
+            self._mark_rect(blocked, rect, grid_step, margin=0.35)
         # The stationary grid is useful for later scoring/cost tuning, but as a
         # hard obstacle it closes many center-line A* corridors in this map.
         # Keep the baseline explainable: hard-block occupied slots and walls.
@@ -438,6 +440,38 @@ class PlannerSkeleton:
                 rects.append(tuple(float(v) for v in slot))
         for rect in self.map_data.get("walls_rects") or []:
             rects.append(tuple(float(v) for v in rect))
+        return rects
+
+    def _line_obstacle_rects(self, half_width: float) -> List[Tuple[float, float, float, float]]:
+        rects: List[Tuple[float, float, float, float]] = []
+        if not self.map_data or self.map_extent is None:
+            return rects
+        xmin, xmax, ymin, ymax = self.map_extent
+        for line in self.map_data.get("lines") or []:
+            if len(line) != 4:
+                continue
+            x1, y1, x2, y2 = (float(v) for v in line)
+            if abs(x1 - x2) < 1e-6:
+                rx0 = min(x1, x2) - half_width
+                rx1 = max(x1, x2) + half_width
+                ry0 = min(y1, y2)
+                ry1 = max(y1, y2)
+            elif abs(y1 - y2) < 1e-6:
+                rx0 = min(x1, x2)
+                rx1 = max(x1, x2)
+                ry0 = min(y1, y2) - half_width
+                ry1 = max(y1, y2) + half_width
+            else:
+                rx0 = min(x1, x2) - half_width
+                rx1 = max(x1, x2) + half_width
+                ry0 = min(y1, y2) - half_width
+                ry1 = max(y1, y2) + half_width
+            rx0 = max(rx0, xmin)
+            rx1 = min(rx1, xmax)
+            ry0 = max(ry0, ymin)
+            ry1 = min(ry1, ymax)
+            if rx1 > rx0 and ry1 > ry0:
+                rects.append((rx0, rx1, ry0, ry1))
         return rects
 
     def _mark_rect(
