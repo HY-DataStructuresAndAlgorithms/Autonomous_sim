@@ -45,6 +45,9 @@ OBSTACLE_STOP_DISTANCE = 0.45
 FRONT_CLEAR_DISTANCE = 6.0
 FRONT_CLEAR_SPEED_BONUS = 0.75
 PARKING_ALIGN_DISTANCE = 4.0
+PARKING_REVERSE_YAW_ERROR = math.radians(32.0)
+PARKING_REVERSE_TICKS = 58
+PARKING_REVERSE_COOLDOWN_TICKS = 45
 
 
 def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
@@ -80,6 +83,8 @@ class PlannerSkeleton:
     final_eval_logged: bool = False
     planning_fail_reason: Optional[str] = None
     blocked_grid_cache: Optional[Tuple[int, int, float, List[List[bool]]]] = None
+    parking_reverse_ticks: int = 0
+    parking_reverse_cooldown: int = 0
 
     def __post_init__(self) -> None:
         if self.waypoints is None:
@@ -107,6 +112,8 @@ class PlannerSkeleton:
         self.final_eval_logged = False
         self.planning_fail_reason = None
         self.blocked_grid_cache = None
+        self.parking_reverse_ticks = 0
+        self.parking_reverse_cooldown = 0
         self.rl_speed = RLSpeedController(enabled=USE_RL_SPEED_CONTROL)
         print(f"[algo] rl_speed_control={'ON' if USE_RL_SPEED_CONTROL else 'OFF'}")
 
@@ -229,7 +236,31 @@ class PlannerSkeleton:
         target_idx = self._lookahead_index(x, y, lookahead=lookahead)
         target_wp = self.waypoints[target_idx]
         gear = target_wp[3]
-        if final_dist < PARKING_ALIGN_DISTANCE:
+        in_parking_mode = final_dist < PARKING_ALIGN_DISTANCE
+        reverse_realigning = False
+        if self.parking_reverse_cooldown > 0:
+            self.parking_reverse_cooldown -= 1
+        if (
+            in_parking_mode
+            and self.parking_reverse_ticks <= 0
+            and self.parking_reverse_cooldown <= 0
+            and final_yaw_error > PARKING_REVERSE_YAW_ERROR
+            and final_dist > max(center_tolerance * 1.8, 0.35)
+        ):
+            self.parking_reverse_ticks = PARKING_REVERSE_TICKS
+            print(
+                "[algo] parking recovery: reverse realignment"
+                f" pos_error={final_dist:.2f}m"
+                f" yaw_error={math.degrees(final_yaw_error):.1f}deg"
+            )
+        if in_parking_mode and self.parking_reverse_ticks > 0:
+            self.parking_reverse_ticks -= 1
+            if self.parking_reverse_ticks <= 0:
+                self.parking_reverse_cooldown = PARKING_REVERSE_COOLDOWN_TICKS
+            target_wp = self._parking_reverse_target(target_center, final_wp[2])
+            gear = "R"
+            reverse_realigning = True
+        elif in_parking_mode:
             target_wp = (target_center[0], target_center[1], final_wp[2], "D")
             gear = "D"
 
@@ -243,6 +274,8 @@ class PlannerSkeleton:
             max_steer=max_steer,
             reverse=(gear == "R"),
         )
+        if reverse_realigning:
+            steer = 0.0
 
         front_clearance = self._estimate_forward_clearance(
             x=x,
@@ -269,6 +302,8 @@ class PlannerSkeleton:
             steer,
             front_clearance,
         )
+        if gear == "R":
+            rule_speed = min(rule_speed, 0.55)
         target_speed = self.rl_speed.adjust_target_speed(
             rule_speed=rule_speed,
             final_dist=final_dist,
@@ -276,10 +311,17 @@ class PlannerSkeleton:
             steer_abs=abs(steer),
             obstacle_dist=front_clearance,
         )
+        straight_clear_full_accel = (
+            gear == "D"
+            and not in_parking_mode
+            and front_is_clear
+            and abs(steer) < math.radians(4.0)
+        )
         accel, brake = self._speed_command(
             speed=speed,
             target_speed=target_speed,
             front_is_clear=front_is_clear and final_dist > 3.0,
+            force_full_accel=straight_clear_full_accel,
         )
         self._log_evaluation(
             parking_success=False,
@@ -301,6 +343,7 @@ class PlannerSkeleton:
                 f" yaw_error={math.degrees(final_yaw_error):.1f}deg"
                 f" min_obstacle_dist~{self.min_obstacle_distance:.2f}m"
                 f" front_clearance~{front_clearance:.2f}m"
+                f" gear={gear}"
                 f" lookahead={lookahead:.2f}m"
                 f" rule_speed={rule_speed:.2f}m/s"
                 f" speed={target_speed:.2f}m/s"
@@ -736,6 +779,17 @@ class PlannerSkeleton:
             steer = -steer
         return max(-max_steer, min(max_steer, steer))
 
+    def _parking_reverse_target(
+        self,
+        target_center: Tuple[float, float],
+        target_yaw: float,
+    ) -> Waypoint:
+        backout_distance = 3.4
+        tx = target_center[0] - math.cos(target_yaw) * backout_distance
+        ty = target_center[1] - math.sin(target_yaw) * backout_distance
+        tx, ty = self._clamp_inside_map(tx, ty, margin=0.2)
+        return tx, ty, target_yaw, "R"
+
     def _target_speed(
         self,
         final_dist: float,
@@ -799,10 +853,13 @@ class PlannerSkeleton:
         speed: float,
         target_speed: float,
         front_is_clear: bool = False,
+        force_full_accel: bool = False,
     ) -> Tuple[float, float]:
         error = target_speed - speed
         if target_speed <= 0.05:
             return 0.0, 1.0
+        if force_full_accel and error > 0.05:
+            return 1.0, 0.0
         if error > 0.15:
             accel_cap = 1.0 if front_is_clear else 0.9
             accel_base = 0.70 if front_is_clear else 0.55
