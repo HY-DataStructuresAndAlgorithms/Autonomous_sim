@@ -44,6 +44,7 @@ OBSTACLE_SLOW_DISTANCE = 1.15
 OBSTACLE_STOP_DISTANCE = 0.45
 FRONT_CLEAR_DISTANCE = 6.0
 FRONT_CLEAR_SPEED_BONUS = 0.75
+PARKING_ALIGN_DISTANCE = 4.0
 
 
 def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
@@ -192,9 +193,12 @@ class PlannerSkeleton:
             target_center = self._slot_center(slot)
             final_dist = math.hypot(target_center[0] - x, target_center[1] - y)
             center_tolerance = self._slot_center_tolerance(slot)
+            slot_entered = self._point_in_slot(slot, x, y, margin=0.05)
         else:
+            target_center = (final_wp[0], final_wp[1])
             final_dist = math.hypot(final_wp[0] - x, final_wp[1] - y)
             center_tolerance = 0.55
+            slot_entered = False
         final_yaw_error = abs(self._wrap_to_pi(final_wp[2] - yaw))
         obstacle_dist = self._estimate_min_obstacle_distance((x, y))
         self.min_obstacle_distance = min(self.min_obstacle_distance, obstacle_dist)
@@ -226,6 +230,9 @@ class PlannerSkeleton:
         target_idx = self._lookahead_index(x, y, lookahead=lookahead)
         target_wp = self.waypoints[target_idx]
         gear = target_wp[3]
+        if final_dist < PARKING_ALIGN_DISTANCE:
+            target_wp = (target_center[0], target_center[1], final_wp[2], "D")
+            gear = "D"
 
         steer = self._pure_pursuit_steer(
             x=x,
@@ -248,6 +255,18 @@ class PlannerSkeleton:
                 current_time=t,
             )
             return {"steer": steer * 0.4, "accel": 0.0, "brake": 1.0, "gear": gear}
+
+        if slot_entered:
+            self._log_evaluation(
+                parking_success=False,
+                fail_reason="stopping_inside_slot",
+                final_position_error=final_dist,
+                final_yaw_error=final_yaw_error,
+                collision=collision_risk,
+                current_time=t,
+                force=True,
+            )
+            return {"steer": steer * 0.25, "accel": 0.0, "brake": 1.0, "gear": "D"}
 
         front_clearance = self._estimate_forward_clearance(
             x=x,
@@ -291,6 +310,7 @@ class PlannerSkeleton:
                 f" wp={self.waypoint_index}/{len(self.waypoints) - 1}"
                 f" pos_error={final_dist:.2f}m"
                 f" center_tolerance={center_tolerance:.2f}m"
+                f" slot_entered={slot_entered}"
                 f" yaw_error={math.degrees(final_yaw_error):.1f}deg"
                 f" min_obstacle_dist~{self.min_obstacle_distance:.2f}m"
                 f" front_clearance~{front_clearance:.2f}m"
@@ -320,6 +340,12 @@ class PlannerSkeleton:
         slot_w = abs(float(slot[1]) - float(slot[0]))
         slot_l = abs(float(slot[3]) - float(slot[2]))
         return max(0.20, 0.10 * min(slot_w, slot_l))
+
+    def _point_in_slot(self, slot: List[float], x: float, y: float, margin: float = 0.0) -> bool:
+        return (
+            float(slot[0]) - margin <= x <= float(slot[1]) + margin
+            and float(slot[2]) - margin <= y <= float(slot[3]) + margin
+        )
 
     def _approach_pose(self, slot: List[float], target_yaw: float) -> Tuple[float, float, float]:
         cx, cy = self._slot_center(slot)
@@ -741,10 +767,14 @@ class PlannerSkeleton:
             target += FRONT_CLEAR_SPEED_BONUS
         if final_dist < 6.0:
             target = 1.15
+        if final_dist < PARKING_ALIGN_DISTANCE:
+            target = min(target, 0.65)
         if final_dist < 2.2:
-            target = 0.55
+            target = 0.28
+        if final_dist < 1.0:
+            target = 0.12
         if yaw_error > math.radians(35.0) or abs(steer) > math.radians(25.0):
-            target = min(target, 0.95)
+            target = min(target, 0.45)
         if obstacle_dist < OBSTACLE_SLOW_DISTANCE:
             target = min(target, 0.45)
         if obstacle_dist < OBSTACLE_STOP_DISTANCE:
