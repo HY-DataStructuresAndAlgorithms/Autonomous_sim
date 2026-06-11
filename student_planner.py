@@ -202,8 +202,7 @@ class PlannerSkeleton:
         final_yaw_error = abs(self._wrap_to_pi(final_wp[2] - yaw))
         obstacle_dist = self._estimate_min_obstacle_distance((x, y))
         self.min_obstacle_distance = min(self.min_obstacle_distance, obstacle_dist)
-
-        collision_risk = obstacle_dist < OBSTACLE_STOP_DISTANCE
+        collision_risk = False
 
         if final_dist <= center_tolerance and final_yaw_error < math.radians(14.0):
             self._log_evaluation(
@@ -245,10 +244,17 @@ class PlannerSkeleton:
             reverse=(gear == "R"),
         )
 
+        front_clearance = self._estimate_forward_clearance(
+            x=x,
+            y=y,
+            yaw=yaw,
+            reverse=(gear == "R"),
+        )
+        collision_risk = front_clearance < OBSTACLE_STOP_DISTANCE
         if collision_risk and final_dist > 1.0:
             self._log_evaluation(
                 parking_success=False,
-                fail_reason="collision_risk",
+                fail_reason="front_collision_risk",
                 final_position_error=final_dist,
                 final_yaw_error=final_yaw_error,
                 collision=True,
@@ -256,30 +262,11 @@ class PlannerSkeleton:
             )
             return {"steer": steer * 0.4, "accel": 0.0, "brake": 1.0, "gear": gear}
 
-        if slot_entered:
-            self._log_evaluation(
-                parking_success=False,
-                fail_reason="stopping_inside_slot",
-                final_position_error=final_dist,
-                final_yaw_error=final_yaw_error,
-                collision=collision_risk,
-                current_time=t,
-                force=True,
-            )
-            return {"steer": steer * 0.25, "accel": 0.0, "brake": 1.0, "gear": "D"}
-
-        front_clearance = self._estimate_forward_clearance(
-            x=x,
-            y=y,
-            yaw=yaw,
-            reverse=(gear == "R"),
-        )
         front_is_clear = front_clearance >= FRONT_CLEAR_DISTANCE
         rule_speed = self._target_speed(
             final_dist,
             final_yaw_error,
             steer,
-            obstacle_dist,
             front_clearance,
         )
         target_speed = self.rl_speed.adjust_target_speed(
@@ -287,7 +274,7 @@ class PlannerSkeleton:
             final_dist=final_dist,
             yaw_error=final_yaw_error,
             steer_abs=abs(steer),
-            obstacle_dist=obstacle_dist,
+            obstacle_dist=front_clearance,
         )
         accel, brake = self._speed_command(
             speed=speed,
@@ -296,7 +283,7 @@ class PlannerSkeleton:
         )
         self._log_evaluation(
             parking_success=False,
-            fail_reason="collision_risk" if collision_risk else self.planning_fail_reason or "running",
+            fail_reason="front_collision_risk" if collision_risk else self.planning_fail_reason or "running",
             final_position_error=final_dist,
             final_yaw_error=final_yaw_error,
             collision=collision_risk,
@@ -754,7 +741,6 @@ class PlannerSkeleton:
         final_dist: float,
         yaw_error: float,
         steer: float,
-        obstacle_dist: float,
         front_clearance: float,
     ) -> float:
         target = 2.10
@@ -775,9 +761,9 @@ class PlannerSkeleton:
             target = 0.12
         if yaw_error > math.radians(35.0) or abs(steer) > math.radians(25.0):
             target = min(target, 0.45)
-        if obstacle_dist < OBSTACLE_SLOW_DISTANCE:
+        if front_clearance < OBSTACLE_SLOW_DISTANCE:
             target = min(target, 0.45)
-        if obstacle_dist < OBSTACLE_STOP_DISTANCE:
+        if front_clearance < OBSTACLE_STOP_DISTANCE:
             target = 0.0
         return target
 
