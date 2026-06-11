@@ -84,7 +84,7 @@ def target_slot(frames: Iterable[dict[str, Any]]) -> tuple[float, float, float, 
     return None
 
 
-def load_sim_map(meta: dict[str, Any]) -> Any | None:
+def load_sim_context(meta: dict[str, Any]) -> dict[str, Any] | None:
     sim_path = SIM_DIR / "demo_self_parking_sim.py"
     if not sim_path.exists():
         return None
@@ -106,7 +106,12 @@ def load_sim_map(meta: dict[str, Any]) -> Any | None:
             sim.AVAILABLE_MAPS[0],
         )
         bundle = sim.ensure_map_loaded(map_cfg, {}, seed=meta.get("map_seed"))
-        return bundle["assets"]
+        stage_idx, stage_profile = sim.get_stage_profile(map_cfg)
+        return {
+            "assets": bundle["assets"],
+            "stage_idx": stage_idx,
+            "stage_profile": stage_profile,
+        }
     except Exception:
         return None
     finally:
@@ -115,6 +120,13 @@ def load_sim_map(meta: dict[str, Any]) -> Any | None:
             sys.path.remove(str(SIM_DIR))
         except ValueError:
             pass
+
+
+def load_sim_map(meta: dict[str, Any]) -> Any | None:
+    context = load_sim_context(meta)
+    if context is None:
+        return None
+    return context.get("assets")
 
 
 def bounds(
@@ -162,6 +174,20 @@ def fmt_number(value: Any, suffix: str = "", digits: int = 1) -> str:
     return "N/A"
 
 
+def fmt_percent(value: Any, digits: int = 1) -> str:
+    if isinstance(value, (int, float)):
+        return f"{float(value) * 100:.{digits}f}%"
+    return "N/A"
+
+
+def fmt_score(value: Any, weight: Any) -> str:
+    if isinstance(value, (int, float)) and isinstance(weight, (int, float)):
+        return f"{float(value):.1f} / {float(weight):.0f}"
+    if isinstance(value, (int, float)):
+        return f"{float(value):.1f}"
+    return "N/A"
+
+
 def final_speed(frames: list[dict[str, Any]]) -> float | None:
     for frame in reversed(frames):
         obs = frame.get("obs", {})
@@ -173,14 +199,92 @@ def final_speed(frames: list[dict[str, Any]]) -> float | None:
     return None
 
 
-def info_lines(meta: dict[str, Any], frames: list[dict[str, Any]]) -> list[str]:
+def detail_metric_lines(meta: dict[str, Any], stats: dict[str, Any]) -> list[str]:
+    details = meta.get("details", {})
+    if not isinstance(details, dict):
+        details = {}
+    component_scores = details.get("component_scores", {})
+    if isinstance(component_scores, dict) and component_scores:
+        weights = {}
+        stage_profile = details.get("stage_profile", {})
+        if isinstance(stage_profile, dict):
+            weights = stage_profile.get("weights", {})
+        if not isinstance(weights, dict):
+            weights = {}
+        component_labels = {
+            "time": "Time",
+            "distance": "Distance",
+            "speed": "Average speed",
+            "steer_flip": "Steering reversals",
+            "parking_iou": "Slot IoU",
+            "parking_orientation": "Orientation match",
+            "parking_stop": "Stopped in slot",
+        }
+        lines = []
+        for key, value in component_scores.items():
+            label = component_labels.get(str(key), str(key))
+            lines.append(f"- {label}: {fmt_score(value, weights.get(key))}")
+        return lines
+
+    expected = stats.get("expected_orientation", "N/A")
+    observed = stats.get("parking_orientation", "N/A")
+    stop_ok = final_stop_text(stats)
+    return [
+        f"- Slot IoU: {fmt_percent(stats.get('parking_iou'))} / {fmt_percent(stats.get('parking_iou_threshold'))}",
+        f"- Orientation: {observed} / {expected}",
+        f"- Stopped in slot: {stop_ok}",
+        f"- Gear switches: {stats.get('gear_switches', 'N/A')}",
+    ]
+
+
+def final_stop_text(stats: dict[str, Any]) -> str:
+    speed = stats.get("final_speed")
+    if isinstance(speed, (int, float)):
+        return "yes" if abs(float(speed)) <= 0.2 else "no"
+    return "N/A"
+
+
+def vs_target_lines(
+    stats: dict[str, Any],
+    stage_profile: dict[str, Any] | None,
+    world_extent: tuple[float, float, float, float] | None,
+) -> list[str]:
+    if stage_profile is None:
+        return [
+            "- Time: N/A",
+            "- Distance: N/A",
+            "- Average speed: N/A",
+            "- Steering reversals: N/A",
+        ]
+
+    xmin, xmax, ymin, ymax = world_extent if world_extent is not None else (0.0, 0.0, 0.0, 0.0)
+    diag = math.hypot(xmax - xmin, ymax - ymin)
+    distance_target = diag * float(stage_profile.get("distance_factor", 1.0)) if diag > 0 else None
+    steer_flips = stats.get("direction_flips", stats.get("steering_reversals"))
+    return [
+        f"- Time: {fmt_number(stats.get('elapsed'), 's', 1)} / {fmt_number(stage_profile.get('time_target'), 's', 1)}",
+        f"- Distance: {fmt_number(stats.get('distance'), 'm', 1)} / {fmt_number(distance_target, 'm', 1)}",
+        f"- Average speed: {fmt_number(stats.get('avg_speed'), 'm/s', 2)} / {fmt_number(stage_profile.get('speed_target'), 'm/s', 2)}",
+        f"- Steering reversals: {steer_flips if isinstance(steer_flips, int) else 'N/A'} / {stage_profile.get('steer_flip_target', 'N/A')}",
+    ]
+
+
+def info_lines(
+    meta: dict[str, Any],
+    frames: list[dict[str, Any]],
+    stage_profile: dict[str, Any] | None = None,
+    world_extent: tuple[float, float, float, float] | None = None,
+) -> list[str]:
     stats = meta.get("stats", {})
     if not isinstance(stats, dict):
         stats = {}
     score = meta.get("score")
     iou = stats.get("parking_iou")
     iou_text = f"{float(iou) * 100:.1f}%" if isinstance(iou, (int, float)) else "N/A"
-    return [
+    final_v = final_speed(frames)
+    stats_with_final = dict(stats)
+    stats_with_final.setdefault("final_speed", final_v)
+    lines = [
         f"Final result: {result_label(meta, frames)}",
         f"Final score: {fmt_number(score, ' / 100', 1)}",
         f"Map: {meta.get('map_name') or meta.get('map_key') or 'N/A'}",
@@ -188,26 +292,38 @@ def info_lines(meta: dict[str, Any], frames: list[dict[str, Any]]) -> list[str]:
         f"Elapsed: {fmt_number(stats.get('elapsed'), 's', 1)}",
         f"Distance: {fmt_number(stats.get('distance'), 'm', 1)}",
         f"Average speed: {fmt_number(stats.get('avg_speed'), 'm/s', 2)}",
-        f"Final speed: {fmt_number(final_speed(frames), 'm/s', 2)}",
+        f"Final speed: {fmt_number(final_v, 'm/s', 2)}",
         f"Parking IoU: {iou_text}",
         f"Orientation: {stats.get('parking_orientation', 'N/A')}",
         f"Required: {stats.get('expected_orientation', 'N/A')}",
         f"Frames: {len(frames)}",
     ]
+    lines.extend(["", "Detailed metrics"])
+    lines.extend(detail_metric_lines(meta, stats_with_final))
+    lines.extend(["", "Vs targets"])
+    lines.extend(vs_target_lines(stats_with_final, stage_profile, world_extent))
+    return lines
 
 
 def draw_info_panel(surface: Any, pygame: Any, font: Any, lines: list[str]) -> None:
-    line_h = 23
-    panel_w = 360
-    panel_h = 28 + line_h * len(lines)
+    line_h = 20
+    panel_w = 430
+    panel_h = 34 + line_h * len(lines)
     panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
     panel.fill((255, 255, 255, 232))
     pygame.draw.rect(panel, (65, 74, 92), panel.get_rect(), 2)
     title = font.render("Simulation Summary", True, (25, 30, 42))
     panel.blit(title, (14, 10))
+    y = 36
     for idx, line in enumerate(lines):
-        text = font.render(line, True, (42, 50, 65))
-        panel.blit(text, (14, 36 + idx * line_h))
+        if not line:
+            y += line_h // 2
+            continue
+        is_heading = line in {"Detailed metrics", "Vs targets"}
+        color = (20, 28, 42) if is_heading else (42, 50, 65)
+        text = font.render(line, True, color)
+        panel.blit(text, (14, y))
+        y += line_h
     surface.blit(panel, (WIDTH - panel_w - 24, HEIGHT - panel_h - 24))
 
 
@@ -281,7 +397,9 @@ def render(
 
     path_points = [(x, y) for x, y, _ in states]
     slot = target_slot(frames)
-    map_assets = load_sim_map(meta)
+    sim_context = load_sim_context(meta)
+    map_assets = sim_context.get("assets") if sim_context else None
+    stage_profile = sim_context.get("stage_profile") if sim_context else None
     if map_assets is not None:
         target_idx = meta.get("target_idx")
         try:
@@ -338,7 +456,7 @@ def render(
     surface.blit(font.render(title, True, (25, 30, 40)), (24, 18))
     surface.blit(small.render(subtitle, True, (70, 78, 92)), (24, 48))
     surface.blit(small.render("green=start  red=end  blue=trajectory", True, (70, 78, 92)), (24, HEIGHT - 36))
-    draw_info_panel(surface, pygame, panel_font, info_lines(meta, frames))
+    draw_info_panel(surface, pygame, panel_font, info_lines(meta, frames, stage_profile, (xmin, xmax, ymin, ymax)))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     pygame.image.save(surface, str(output_path))
