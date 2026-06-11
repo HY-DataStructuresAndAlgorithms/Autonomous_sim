@@ -21,6 +21,7 @@ import heapq
 import json
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -68,6 +69,7 @@ class PlannerSkeleton:
     last_eval_log_time: float = -999.0
     final_eval_logged: bool = False
     planning_fail_reason: Optional[str] = None
+    blocked_grid_cache: Optional[Tuple[int, int, float, List[List[bool]]]] = None
 
     def __post_init__(self) -> None:
         if self.waypoints is None:
@@ -94,6 +96,7 @@ class PlannerSkeleton:
         self.last_eval_log_time = -999.0
         self.final_eval_logged = False
         self.planning_fail_reason = None
+        self.blocked_grid_cache = None
         self.rl_speed = RLSpeedController(enabled=USE_RL_SPEED_CONTROL)
         print(f"[algo] rl_speed_control={'ON' if USE_RL_SPEED_CONTROL else 'OFF'}")
 
@@ -275,8 +278,8 @@ class PlannerSkeleton:
         slot_l = abs(float(slot[3]) - float(slot[2]))
         forward = (math.cos(target_yaw), math.sin(target_yaw))
         lateral = (-math.sin(target_yaw), math.cos(target_yaw))
-        distances = [max(2.6, slot_l * 0.75), max(3.6, slot_l), max(4.8, slot_l * 1.25)]
-        lateral_offsets = [0.0, 0.35 * slot_w, -0.35 * slot_w, 0.70 * slot_w, -0.70 * slot_w]
+        distances = [max(2.6, slot_l * 0.75), max(3.6, slot_l)]
+        lateral_offsets = [0.0, 0.35 * slot_w, -0.35 * slot_w]
         candidates: List[Tuple[float, float, float]] = []
         for distance in distances:
             for lateral_offset in lateral_offsets:
@@ -293,6 +296,7 @@ class PlannerSkeleton:
         target_pose: Tuple[float, float, float],
     ) -> Optional[Tuple[Tuple[float, float, float], List[Tuple[float, float]], float]]:
         best: Optional[Tuple[Tuple[float, float, float], List[Tuple[float, float]], float]] = None
+        started_at = time.perf_counter()
         for candidate in candidates:
             grid_path = self._astar_path(start_xy, (candidate[0], candidate[1]))
             if not grid_path:
@@ -305,6 +309,8 @@ class PlannerSkeleton:
             cost = path_len + 0.65 * final_leg + 2.0 * yaw_align + clearance_penalty
             if best is None or cost < best[2]:
                 best = (candidate, grid_path, cost)
+            if best is not None and time.perf_counter() - started_at > 0.08:
+                break
         return best
 
     def _append_final_alignment(
@@ -335,7 +341,7 @@ class PlannerSkeleton:
         grid_step = max(self.cell_size, 0.5)
         cols = max(1, int(math.ceil((xmax - xmin) / grid_step)))
         rows = max(1, int(math.ceil((ymax - ymin) / grid_step)))
-        blocked = self._build_blocked_grid(rows, cols, grid_step)
+        blocked = self._cached_blocked_grid(rows, cols, grid_step)
 
         def to_cell(point: Tuple[float, float]) -> Tuple[int, int]:
             px, py = point
@@ -396,6 +402,17 @@ class PlannerSkeleton:
         path.extend(to_world(cell) for cell in cells[1:-1])
         path.append(goal_xy)
         return path
+
+    def _cached_blocked_grid(self, rows: int, cols: int, grid_step: float) -> List[List[bool]]:
+        if (
+            self.blocked_grid_cache is None
+            or self.blocked_grid_cache[0] != rows
+            or self.blocked_grid_cache[1] != cols
+            or abs(self.blocked_grid_cache[2] - grid_step) > 1e-9
+        ):
+            base = self._build_blocked_grid(rows, cols, grid_step)
+            self.blocked_grid_cache = (rows, cols, grid_step, base)
+        return [row[:] for row in self.blocked_grid_cache[3]]
 
     def _build_blocked_grid(self, rows: int, cols: int, grid_step: float) -> List[List[bool]]:
         blocked = [[False for _ in range(cols)] for _ in range(rows)]
