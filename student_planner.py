@@ -43,7 +43,7 @@ EXTRA_SAFETY_MARGIN = 0.0
 OBSTACLE_SLOW_DISTANCE = 1.15
 OBSTACLE_STOP_DISTANCE = 0.45
 FRONT_CLEAR_DISTANCE = 6.0
-FRONT_CLEAR_SPEED_BONUS = 0.40
+FRONT_CLEAR_SPEED_BONUS = 0.75
 
 
 def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
@@ -728,7 +728,7 @@ class PlannerSkeleton:
         obstacle_dist: float,
         front_clearance: float,
     ) -> float:
-        target = 1.65
+        target = 2.10
         if (
             front_clearance >= FRONT_CLEAR_DISTANCE
             and final_dist > 4.0
@@ -737,13 +737,13 @@ class PlannerSkeleton:
         ):
             target += FRONT_CLEAR_SPEED_BONUS
         if final_dist < 6.0:
-            target = 0.95
+            target = 1.15
         if final_dist < 2.2:
-            target = 0.45
+            target = 0.55
         if yaw_error > math.radians(35.0) or abs(steer) > math.radians(25.0):
-            target = min(target, 0.75)
+            target = min(target, 0.95)
         if obstacle_dist < OBSTACLE_SLOW_DISTANCE:
-            target = min(target, 0.30)
+            target = min(target, 0.45)
         if obstacle_dist < OBSTACLE_STOP_DISTANCE:
             target = 0.0
         return target
@@ -783,9 +783,9 @@ class PlannerSkeleton:
         if target_speed <= 0.05:
             return 0.0, 1.0
         if error > 0.15:
-            accel_cap = 0.78 if front_is_clear else 0.62
-            accel_base = 0.30 if front_is_clear else 0.22
-            accel_gain = 0.34 if front_is_clear else 0.28
+            accel_cap = 0.95 if front_is_clear else 0.75
+            accel_base = 0.42 if front_is_clear else 0.30
+            accel_gain = 0.42 if front_is_clear else 0.34
             return min(accel_cap, accel_base + accel_gain * error), 0.0
         if error < -0.08:
             return 0.0, min(0.8, 0.25 + 0.35 * (-error))
