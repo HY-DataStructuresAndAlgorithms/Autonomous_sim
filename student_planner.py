@@ -42,6 +42,8 @@ PLANNING_OBSTACLE_MARGIN = VEHICLE_CENTER_CLEARANCE
 EXTRA_SAFETY_MARGIN = 0.0
 OBSTACLE_SLOW_DISTANCE = 1.15
 OBSTACLE_STOP_DISTANCE = 0.45
+FRONT_CLEAR_DISTANCE = 6.0
+FRONT_CLEAR_SPEED_BONUS = 0.40
 
 
 def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
@@ -240,7 +242,20 @@ class PlannerSkeleton:
             )
             return {"steer": steer * 0.4, "accel": 0.0, "brake": 1.0, "gear": gear}
 
-        rule_speed = self._target_speed(final_dist, final_yaw_error, steer, obstacle_dist)
+        front_clearance = self._estimate_forward_clearance(
+            x=x,
+            y=y,
+            yaw=yaw,
+            reverse=(gear == "R"),
+        )
+        front_is_clear = front_clearance >= FRONT_CLEAR_DISTANCE
+        rule_speed = self._target_speed(
+            final_dist,
+            final_yaw_error,
+            steer,
+            obstacle_dist,
+            front_clearance,
+        )
         target_speed = self.rl_speed.adjust_target_speed(
             rule_speed=rule_speed,
             final_dist=final_dist,
@@ -248,7 +263,11 @@ class PlannerSkeleton:
             steer_abs=abs(steer),
             obstacle_dist=obstacle_dist,
         )
-        accel, brake = self._speed_command(speed=speed, target_speed=target_speed)
+        accel, brake = self._speed_command(
+            speed=speed,
+            target_speed=target_speed,
+            front_is_clear=front_is_clear and final_dist > 3.0,
+        )
         self._log_evaluation(
             parking_success=False,
             fail_reason="collision_risk" if collision_risk else self.planning_fail_reason or "running",
@@ -266,6 +285,7 @@ class PlannerSkeleton:
                 f" pos_error={final_dist:.2f}m"
                 f" yaw_error={math.degrees(final_yaw_error):.1f}deg"
                 f" min_obstacle_dist~{self.min_obstacle_distance:.2f}m"
+                f" front_clearance~{front_clearance:.2f}m"
                 f" lookahead={lookahead:.2f}m"
                 f" rule_speed={rule_speed:.2f}m/s"
                 f" speed={target_speed:.2f}m/s"
@@ -683,8 +703,16 @@ class PlannerSkeleton:
         yaw_error: float,
         steer: float,
         obstacle_dist: float,
+        front_clearance: float,
     ) -> float:
         target = 1.65
+        if (
+            front_clearance >= FRONT_CLEAR_DISTANCE
+            and final_dist > 4.0
+            and yaw_error < math.radians(25.0)
+            and abs(steer) < math.radians(22.0)
+        ):
+            target += FRONT_CLEAR_SPEED_BONUS
         if final_dist < 6.0:
             target = 0.95
         if final_dist < 2.2:
@@ -722,23 +750,63 @@ class PlannerSkeleton:
             for i in range(1, len(path))
         )
 
-    def _speed_command(self, speed: float, target_speed: float) -> Tuple[float, float]:
+    def _speed_command(
+        self,
+        speed: float,
+        target_speed: float,
+        front_is_clear: bool = False,
+    ) -> Tuple[float, float]:
         error = target_speed - speed
         if target_speed <= 0.05:
             return 0.0, 1.0
         if error > 0.15:
-            return min(0.62, 0.22 + 0.28 * error), 0.0
+            accel_cap = 0.78 if front_is_clear else 0.62
+            accel_base = 0.30 if front_is_clear else 0.22
+            accel_gain = 0.34 if front_is_clear else 0.28
+            return min(accel_cap, accel_base + accel_gain * error), 0.0
         if error < -0.08:
             return 0.0, min(0.8, 0.25 + 0.35 * (-error))
         return 0.0, 0.0
 
+    def _estimate_forward_clearance(
+        self,
+        x: float,
+        y: float,
+        yaw: float,
+        reverse: bool = False,
+        max_distance: float = FRONT_CLEAR_DISTANCE,
+    ) -> float:
+        heading = self._wrap_to_pi(yaw + math.pi) if reverse else yaw
+        step = 0.5
+        distance = step
+        while distance <= max_distance:
+            px = x + math.cos(heading) * distance
+            py = y + math.sin(heading) * distance
+            if self._estimate_clearance(
+                (px, py),
+                include_lines=True,
+            ) <= 0.05:
+                return distance
+            distance += step
+        return max_distance
+
     def _estimate_min_obstacle_distance(self, point: Tuple[float, float]) -> float:
+        return self._estimate_clearance(point, include_lines=False)
+
+    def _estimate_clearance(
+        self,
+        point: Tuple[float, float],
+        include_lines: bool = False,
+    ) -> float:
         px, py = point
         best = float("inf")
         if self.map_extent is not None:
             xmin, xmax, ymin, ymax = self.map_extent
             best = min(best, px - xmin, xmax - px, py - ymin, ymax - py)
-        for rx0, rx1, ry0, ry1 in self._obstacle_rects():
+        rects = self._obstacle_rects()
+        if include_lines:
+            rects = rects + self._line_obstacle_rects(half_width=0.08)
+        for rx0, rx1, ry0, ry1 in rects:
             dx = max(rx0 - px, 0.0, px - rx1)
             dy = max(ry0 - py, 0.0, py - ry1)
             best = min(best, math.hypot(dx, dy))
