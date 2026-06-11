@@ -35,6 +35,13 @@ USE_RL_SPEED_CONTROL = os.getenv("PARKING_USE_RL_SPEED", "1").lower() not in {
     "off",
     "no",
 }
+VEHICLE_LONGEST_LENGTH = 3.0
+CAR_CLEARANCE_RADIUS = 0.5 * VEHICLE_LONGEST_LENGTH * 1.20
+PLANNING_OBSTACLE_MARGIN = CAR_CLEARANCE_RADIUS
+EXTRA_SAFETY_MARGIN = 0.0
+OBSTACLE_SLOW_DISTANCE = 1.15
+OBSTACLE_STOP_DISTANCE = 0.45
+STEER_COMMAND_LIMIT_RATIO = 0.82
 
 
 def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
@@ -179,7 +186,7 @@ class PlannerSkeleton:
         obstacle_dist = self._estimate_min_obstacle_distance((x, y))
         self.min_obstacle_distance = min(self.min_obstacle_distance, obstacle_dist)
 
-        collision_risk = obstacle_dist < 0.08
+        collision_risk = obstacle_dist < OBSTACLE_STOP_DISTANCE
 
         if final_dist < 0.55 and final_yaw_error < math.radians(14.0):
             self._log_evaluation(
@@ -216,6 +223,17 @@ class PlannerSkeleton:
             max_steer=max_steer,
             reverse=(gear == "R"),
         )
+
+        if collision_risk and final_dist > 1.0:
+            self._log_evaluation(
+                parking_success=False,
+                fail_reason="collision_risk",
+                final_position_error=final_dist,
+                final_yaw_error=final_yaw_error,
+                collision=True,
+                current_time=t,
+            )
+            return {"steer": steer * 0.4, "accel": 0.0, "brake": 1.0, "gear": gear}
 
         rule_speed = self._target_speed(final_dist, final_yaw_error, steer, obstacle_dist)
         target_speed = self.rl_speed.adjust_target_speed(
@@ -305,7 +323,7 @@ class PlannerSkeleton:
             clearance = self._estimate_min_obstacle_distance((candidate[0], candidate[1]))
             final_leg = math.hypot(target_pose[0] - candidate[0], target_pose[1] - candidate[1])
             yaw_align = abs(self._wrap_to_pi(candidate[2] - target_pose[2]))
-            clearance_penalty = 4.0 / max(clearance, 0.25)
+            clearance_penalty = 8.0 / max(clearance, 0.20)
             cost = path_len + 0.65 * final_leg + 2.0 * yaw_align + clearance_penalty
             if best is None or cost < best[2]:
                 best = (candidate, grid_path, cost)
@@ -355,8 +373,8 @@ class PlannerSkeleton:
 
         start = to_cell(start_xy)
         goal = to_cell(goal_xy)
-        self._clear_cell(blocked, start, radius=2)
-        self._clear_cell(blocked, goal, radius=3)
+        self._clear_cell(blocked, start, radius=3)
+        self._clear_cell(blocked, goal, radius=4)
 
         open_heap: List[Tuple[float, float, Tuple[int, int]]] = []
         heapq.heappush(open_heap, (0.0, 0.0, start))
@@ -421,9 +439,9 @@ class PlannerSkeleton:
         xmin, _, _, ymax = self.map_extent
 
         for rect in self._obstacle_rects():
-            self._mark_rect(blocked, rect, grid_step, margin=0.35)
+            self._mark_rect(blocked, rect, grid_step, margin=PLANNING_OBSTACLE_MARGIN)
         for rect in self._line_obstacle_rects(half_width=0.08):
-            self._mark_rect(blocked, rect, grid_step, margin=0.35)
+            self._mark_rect(blocked, rect, grid_step, margin=PLANNING_OBSTACLE_MARGIN)
         # The stationary grid is useful for later scoring/cost tuning, but as a
         # hard obstacle it closes many center-line A* corridors in this map.
         # Keep the baseline explainable: hard-block occupied slots and walls.
@@ -574,14 +592,16 @@ class PlannerSkeleton:
         return len(self.waypoints) - 1
 
     def _adaptive_lookahead(self, speed: float, final_dist: float, yaw_error: float) -> float:
-        lookahead = 1.05 + 0.35 * min(speed, 3.0)
+        lookahead = 1.65 + 0.45 * min(speed, 3.0)
+        if final_dist > 12.0 and yaw_error < math.radians(25.0):
+            lookahead = max(lookahead, 2.15)
         if final_dist < 6.0:
-            lookahead = min(lookahead, 0.95)
+            lookahead = min(lookahead, 1.05)
         if final_dist < 2.5:
-            lookahead = min(lookahead, 0.65)
+            lookahead = min(lookahead, 0.70)
         if yaw_error > math.radians(35.0):
-            lookahead = min(lookahead, 0.75)
-        return max(0.45, lookahead)
+            lookahead = min(lookahead, 0.90)
+        return max(0.65, lookahead)
 
     def _pure_pursuit_steer(
         self,
@@ -599,12 +619,13 @@ class PlannerSkeleton:
         tracking_yaw = self._wrap_to_pi(yaw + math.pi) if reverse else yaw
         local_x = math.cos(tracking_yaw) * dx + math.sin(tracking_yaw) * dy
         local_y = -math.sin(tracking_yaw) * dx + math.cos(tracking_yaw) * dy
-        lookahead = max(0.5, math.hypot(local_x, local_y))
+        lookahead = max(0.9, math.hypot(local_x, local_y))
         alpha = math.atan2(local_y, local_x)
         steer = math.atan2(2.0 * wheelbase * math.sin(alpha), lookahead)
         if reverse:
             steer = -steer
-        return max(-max_steer, min(max_steer, steer))
+        command_limit = max_steer * STEER_COMMAND_LIMIT_RATIO
+        return max(-command_limit, min(command_limit, steer))
 
     def _target_speed(
         self,
@@ -613,21 +634,24 @@ class PlannerSkeleton:
         steer: float,
         obstacle_dist: float,
     ) -> float:
-        target = 1.25
+        target = 1.65
         if final_dist < 6.0:
-            target = 0.75
+            target = 0.95
         if final_dist < 2.2:
-            target = 0.38
+            target = 0.45
         if yaw_error > math.radians(35.0) or abs(steer) > math.radians(25.0):
-            target = min(target, 0.55)
-        if obstacle_dist < 1.4:
-            target = min(target, 0.35)
+            target = min(target, 0.75)
+        if obstacle_dist < OBSTACLE_SLOW_DISTANCE:
+            target = min(target, 0.30)
+        if obstacle_dist < OBSTACLE_STOP_DISTANCE:
+            target = 0.0
         return target
 
     def _inside_map(self, x: float, y: float, margin: float = 0.4) -> bool:
         if self.map_extent is None:
             return True
         xmin, xmax, ymin, ymax = self.map_extent
+        margin = max(margin, CAR_CLEARANCE_RADIUS + EXTRA_SAFETY_MARGIN)
         return xmin + margin <= x <= xmax - margin and ymin + margin <= y <= ymax - margin
 
     def _path_length(self, path: List[Tuple[float, float]]) -> float:
@@ -640,8 +664,10 @@ class PlannerSkeleton:
 
     def _speed_command(self, speed: float, target_speed: float) -> Tuple[float, float]:
         error = target_speed - speed
+        if target_speed <= 0.05:
+            return 0.0, 1.0
         if error > 0.15:
-            return min(0.45, 0.18 + 0.25 * error), 0.0
+            return min(0.62, 0.22 + 0.28 * error), 0.0
         if error < -0.08:
             return 0.0, min(0.8, 0.25 + 0.35 * (-error))
         return 0.0, 0.0
@@ -649,11 +675,14 @@ class PlannerSkeleton:
     def _estimate_min_obstacle_distance(self, point: Tuple[float, float]) -> float:
         px, py = point
         best = float("inf")
+        if self.map_extent is not None:
+            xmin, xmax, ymin, ymax = self.map_extent
+            best = min(best, px - xmin, xmax - px, py - ymin, ymax - py)
         for rx0, rx1, ry0, ry1 in self._obstacle_rects():
             dx = max(rx0 - px, 0.0, px - rx1)
             dy = max(ry0 - py, 0.0, py - ry1)
             best = min(best, math.hypot(dx, dy))
-        return best
+        return max(0.0, best - CAR_CLEARANCE_RADIUS - EXTRA_SAFETY_MARGIN)
 
     def _log_evaluation(
         self,
