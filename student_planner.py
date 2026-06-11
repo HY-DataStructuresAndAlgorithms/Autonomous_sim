@@ -322,40 +322,32 @@ class PlannerSkeleton:
         return max(0.20, 0.10 * min(slot_w, slot_l))
 
     def _approach_pose(self, slot: List[float], target_yaw: float) -> Tuple[float, float, float]:
-        cx = 0.5 * (float(slot[0]) + float(slot[1]))
-        cy = 0.5 * (float(slot[2]) + float(slot[3]))
-        slot_len = abs(float(slot[3]) - float(slot[2]))
-        offset = max(4.0, slot_len * 1.1)
-        return cx - math.cos(target_yaw) * offset, cy - math.sin(target_yaw) * offset, target_yaw
+        cx, cy = self._slot_center(slot)
+        above = (cx, cy + 3.0, target_yaw)
+        if self._is_valid_approach_point(above[0], above[1]):
+            return above
+        return cx, cy - 3.0, target_yaw
 
     def _approach_candidates(
         self,
         slot: List[float],
         target_yaw: float,
     ) -> List[Tuple[float, float, float]]:
-        cx = 0.5 * (float(slot[0]) + float(slot[1]))
-        cy = 0.5 * (float(slot[2]) + float(slot[3]))
-        slot_w = abs(float(slot[1]) - float(slot[0]))
-        slot_l = abs(float(slot[3]) - float(slot[2]))
-        forward = (math.cos(target_yaw), math.sin(target_yaw))
-        lateral = (-math.sin(target_yaw), math.cos(target_yaw))
-        distances = [max(4.0, slot_l * 1.0), max(5.5, slot_l * 1.3)]
-        lateral_offsets = [0.0, 0.20 * slot_w, -0.20 * slot_w]
+        cx, cy = self._slot_center(slot)
+        above = (cx, cy + 3.0, target_yaw)
+        below = (cx, cy - 3.0, target_yaw)
         candidates: List[Tuple[float, float, float]] = []
-        for distance in distances:
-            for lateral_offset in lateral_offsets:
-                ax = cx - forward[0] * distance + lateral[0] * lateral_offset
-                ay = cy - forward[1] * distance + lateral[1] * lateral_offset
-                if not self._inside_map(ax, ay):
-                    ax, ay = self._clamp_inside_map(ax, ay)
-                if self._estimate_clearance((ax, ay), include_lines=True) > 0.20:
-                    candidate = (ax, ay, target_yaw)
-                    if all(math.hypot(ax - old[0], ay - old[1]) > 0.3 for old in candidates):
-                        candidates.append(candidate)
+        if self._is_valid_approach_point(above[0], above[1]):
+            candidates.append(above)
+        elif self._is_valid_approach_point(below[0], below[1]):
+            candidates.append(below)
         if candidates:
             return candidates
-        fallback = self._clamp_inside_map(*self._approach_pose(slot, target_yaw)[:2])
-        return [(fallback[0], fallback[1], target_yaw)]
+        fallback_x, fallback_y = self._clamp_inside_map(below[0], below[1])
+        return [(fallback_x, fallback_y, target_yaw)]
+
+    def _is_valid_approach_point(self, x: float, y: float) -> bool:
+        return self._inside_map(x, y) and self._estimate_min_obstacle_distance((x, y)) > 0.20
 
     def _select_best_plan(
         self,
@@ -406,15 +398,15 @@ class PlannerSkeleton:
             return [(target_pose[0], target_pose[1])]
         points = list(approach_path)
         tx, ty, target_yaw = target_pose
-        forward = (math.cos(target_yaw), math.sin(target_yaw))
-        alignment_distances = [4.0, 3.0, 2.0, 1.2, 0.45, 0.0]
+        approach_side = 1.0 if points[-1][1] >= ty else -1.0
+        alignment_distances = [3.0, 2.0, 1.2, 0.45, 0.0]
         for distance in alignment_distances:
             if distance == 0.0:
                 point = (tx, ty)
                 if math.hypot(point[0] - points[-1][0], point[1] - points[-1][1]) > 0.25:
                     points.append(point)
                 continue
-            point = (tx - forward[0] * distance, ty - forward[1] * distance)
+            point = (tx, ty + approach_side * distance)
             if not self._inside_map(point[0], point[1], margin=0.2):
                 point = self._clamp_inside_map(point[0], point[1], margin=0.2)
             if math.hypot(point[0] - points[-1][0], point[1] - points[-1][1]) > 0.25:
