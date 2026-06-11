@@ -9,8 +9,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
+import os
+import sys
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -19,6 +22,7 @@ WIDTH = 1400
 HEIGHT = 850
 PADDING = 60
 SCRIPT_DIR = Path(__file__).resolve().parent
+SIM_DIR = SCRIPT_DIR.parent / "self-parking-sim"
 
 
 def load_replay(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -80,11 +84,51 @@ def target_slot(frames: Iterable[dict[str, Any]]) -> tuple[float, float, float, 
     return None
 
 
+def load_sim_map(meta: dict[str, Any]) -> Any | None:
+    sim_path = SIM_DIR / "demo_self_parking_sim.py"
+    if not sim_path.exists():
+        return None
+
+    spec = importlib.util.spec_from_file_location("parking_sim_for_replay_render", sim_path)
+    if spec is None or spec.loader is None:
+        return None
+
+    old_cwd = Path.cwd()
+    try:
+        sys.path.insert(0, str(SIM_DIR))
+        os.chdir(SIM_DIR)
+        sim = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = sim
+        spec.loader.exec_module(sim)
+        map_key = meta.get("map_key")
+        map_cfg = next(
+            (cfg for cfg in sim.AVAILABLE_MAPS if cfg.get("key") == map_key),
+            sim.AVAILABLE_MAPS[0],
+        )
+        bundle = sim.ensure_map_loaded(map_cfg, {}, seed=meta.get("map_seed"))
+        return bundle["assets"]
+    except Exception:
+        return None
+    finally:
+        os.chdir(old_cwd)
+        try:
+            sys.path.remove(str(SIM_DIR))
+        except ValueError:
+            pass
+
+
 def bounds(
     points: list[tuple[float, float]],
     slot: tuple[float, float, float, float] | None,
     meta: dict[str, Any],
+    map_assets: Any | None = None,
 ) -> tuple[float, float, float, float]:
+    if map_assets is not None:
+        try:
+            return tuple(float(v) for v in map_assets.extent)
+        except (TypeError, ValueError):
+            pass
+
     extent = meta.get("map_extent")
     if isinstance(extent, list) and len(extent) == 4:
         try:
@@ -167,6 +211,57 @@ def draw_info_panel(surface: Any, pygame: Any, font: Any, lines: list[str]) -> N
     surface.blit(panel, (WIDTH - panel_w - 24, HEIGHT - panel_h - 24))
 
 
+def screen_rect(
+    rect: tuple[float, float, float, float],
+    to_screen: Any,
+    pygame: Any,
+) -> Any:
+    x0, y0 = to_screen(rect[0], rect[2])
+    x1, y1 = to_screen(rect[1], rect[3])
+    return pygame.Rect(min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0))
+
+
+def draw_slot_rect(surface: Any, pygame: Any, rect: tuple[float, float, float, float], to_screen: Any, color: tuple[int, int, int], width: int = 0) -> None:
+    pygame.draw.rect(surface, color, screen_rect(rect, to_screen, pygame), width)
+
+
+def draw_map(
+    surface: Any,
+    pygame: Any,
+    map_assets: Any | None,
+    slot: tuple[float, float, float, float] | None,
+    to_screen: Any,
+) -> None:
+    if map_assets is None:
+        return
+
+    try:
+        for rect in map_assets.walls_rects:
+            draw_slot_rect(surface, pygame, tuple(float(v) for v in rect), to_screen, (0, 0, 0), 0)
+        for x1, y1, x2, y2 in map_assets.lines:
+            pygame.draw.line(
+                surface,
+                (0, 0, 0),
+                to_screen(float(x1), float(y1)),
+                to_screen(float(x2), float(y2)),
+                3,
+            )
+        for idx, rect in enumerate(map_assets.slots):
+            r = tuple(float(v) for v in rect)
+            if idx < len(map_assets.occupied_idx) and bool(map_assets.occupied_idx[idx]):
+                draw_slot_rect(surface, pygame, r, to_screen, (0, 0, 0), 0)
+        for rect in map_assets.slots:
+            draw_slot_rect(surface, pygame, tuple(float(v) for v in rect), to_screen, (0, 0, 0), 2)
+        if hasattr(map_assets, "border"):
+            draw_slot_rect(surface, pygame, tuple(float(v) for v in map_assets.border), to_screen, (0, 0, 0), 4)
+    except Exception:
+        return
+
+    if slot is not None:
+        draw_slot_rect(surface, pygame, slot, to_screen, (180, 255, 180), 0)
+        draw_slot_rect(surface, pygame, slot, to_screen, (50, 140, 50), 2)
+
+
 def render(
     replay_path: Path,
     output_path: Path,
@@ -186,7 +281,15 @@ def render(
 
     path_points = [(x, y) for x, y, _ in states]
     slot = target_slot(frames)
-    xmin, xmax, ymin, ymax = bounds(path_points, slot, meta)
+    map_assets = load_sim_map(meta)
+    if map_assets is not None:
+        target_idx = meta.get("target_idx")
+        try:
+            if isinstance(target_idx, int) and 0 <= target_idx < len(map_assets.slots):
+                slot = tuple(float(v) for v in map_assets.slots[target_idx])
+        except Exception:
+            pass
+    xmin, xmax, ymin, ymax = bounds(path_points, slot, meta, map_assets)
     world_w = max(xmax - xmin, 1e-6)
     world_h = max(ymax - ymin, 1e-6)
     scale = min((WIDTH - 2 * PADDING) / world_w, (HEIGHT - 2 * PADDING) / world_h)
@@ -205,8 +308,9 @@ def render(
     panel_font = pygame.font.Font(None, 23)
 
     pygame.draw.rect(surface, (220, 224, 232), (PADDING, PADDING, WIDTH - 2 * PADDING, HEIGHT - 2 * PADDING), 1)
+    draw_map(surface, pygame, map_assets, slot, to_screen)
 
-    if slot is not None:
+    if slot is not None and map_assets is None:
         x0, y0 = to_screen(slot[0], slot[2])
         x1, y1 = to_screen(slot[1], slot[3])
         rect = pygame.Rect(min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0))
