@@ -127,7 +127,12 @@ class PlannerSkeleton:
         self.target_signature = tuple(round(float(v), 3) for v in slot)
         target_pose = self._target_pose(slot)
         candidates = self._approach_candidates(slot, target_pose[2])
-        best_plan = self._select_best_plan((start[0], start[1]), candidates, target_pose)
+        best_plan = self._select_best_plan(
+            (start[0], start[1]),
+            candidates,
+            target_pose,
+            start_yaw=start[2],
+        )
 
         if best_plan is None:
             self.planning_fail_reason = "all_approach_candidates_failed"
@@ -299,24 +304,34 @@ class PlannerSkeleton:
         distances = [max(2.6, slot_l * 0.75), max(3.6, slot_l)]
         lateral_offsets = [0.0, 0.35 * slot_w, -0.35 * slot_w]
         candidates: List[Tuple[float, float, float]] = []
-        for distance in distances:
-            for lateral_offset in lateral_offsets:
-                ax = cx - forward[0] * distance + lateral[0] * lateral_offset
-                ay = cy - forward[1] * distance + lateral[1] * lateral_offset
-                if self._inside_map(ax, ay):
-                    candidates.append((ax, ay, target_yaw))
-        return candidates or [self._approach_pose(slot, target_yaw)]
+        for side in (1.0, -1.0):
+            for distance in distances:
+                for lateral_offset in lateral_offsets:
+                    ax = cx - side * forward[0] * distance + lateral[0] * lateral_offset
+                    ay = cy - side * forward[1] * distance + lateral[1] * lateral_offset
+                    if self._inside_map(ax, ay):
+                        candidates.append((ax, ay, target_yaw))
+        if candidates:
+            return candidates
+        fallback = self._clamp_inside_map(*self._approach_pose(slot, target_yaw)[:2])
+        return [(fallback[0], fallback[1], target_yaw)]
 
     def _select_best_plan(
         self,
         start_xy: Tuple[float, float],
         candidates: List[Tuple[float, float, float]],
         target_pose: Tuple[float, float, float],
+        start_yaw: float,
     ) -> Optional[Tuple[Tuple[float, float, float], List[Tuple[float, float]], float]]:
         best: Optional[Tuple[Tuple[float, float, float], List[Tuple[float, float]], float]] = None
         started_at = time.perf_counter()
         for candidate in candidates:
-            grid_path = self._astar_path(start_xy, (candidate[0], candidate[1]))
+            grid_path = self._astar_path(
+                start_xy,
+                (candidate[0], candidate[1]),
+                start_yaw=start_yaw,
+                goal_yaw=candidate[2],
+            )
             if not grid_path:
                 continue
             path_len = self._path_length(grid_path)
@@ -344,6 +359,10 @@ class PlannerSkeleton:
         alignment_distances = [2.2, 1.2, 0.45, 0.0]
         for distance in alignment_distances:
             point = (tx - forward[0] * distance, ty - forward[1] * distance)
+            if not self._inside_map(point[0], point[1], margin=0.2):
+                point = (tx + forward[0] * distance, ty + forward[1] * distance)
+            if not self._inside_map(point[0], point[1], margin=0.2):
+                point = self._clamp_inside_map(point[0], point[1], margin=0.2)
             if math.hypot(point[0] - points[-1][0], point[1] - points[-1][1]) > 0.25:
                 points.append(point)
         return points
@@ -352,6 +371,8 @@ class PlannerSkeleton:
         self,
         start_xy: Tuple[float, float],
         goal_xy: Tuple[float, float],
+        start_yaw: Optional[float] = None,
+        goal_yaw: Optional[float] = None,
     ) -> List[Tuple[float, float]]:
         if self.map_extent is None:
             return []
@@ -376,32 +397,50 @@ class PlannerSkeleton:
         self._clear_cell(blocked, start, radius=3)
         self._clear_cell(blocked, goal, radius=4)
 
-        open_heap: List[Tuple[float, float, Tuple[int, int]]] = []
-        heapq.heappush(open_heap, (0.0, 0.0, start))
-        came_from: Dict[Tuple[int, int], Tuple[int, int]] = {}
-        cost_so_far: Dict[Tuple[int, int], float] = {start: 0.0}
-        motions = [
-            (-1, 0, 1.0),
-            (1, 0, 1.0),
-            (0, -1, 1.0),
-            (0, 1, 1.0),
-            (-1, -1, 1.414),
-            (-1, 1, 1.414),
-            (1, -1, 1.414),
-            (1, 1, 1.414),
+        heading_moves = [
+            (0, 1, 0.0),       # east
+            (-1, 1, math.pi / 4.0),
+            (-1, 0, math.pi / 2.0),
+            (-1, -1, 3.0 * math.pi / 4.0),
+            (0, -1, math.pi),
+            (1, -1, -3.0 * math.pi / 4.0),
+            (1, 0, -math.pi / 2.0),
+            (1, 1, -math.pi / 4.0),
         ]
+        start_heading = self._heading_index(start_yaw if start_yaw is not None else 0.0)
+        goal_heading = self._heading_index(goal_yaw) if goal_yaw is not None else None
+        start_state = (start[0], start[1], start_heading)
+
+        open_heap: List[Tuple[float, float, Tuple[int, int, int]]] = []
+        heapq.heappush(open_heap, (0.0, 0.0, start_state))
+        came_from: Dict[Tuple[int, int, int], Tuple[int, int, int]] = {}
+        cost_so_far: Dict[Tuple[int, int, int], float] = {start_state: 0.0}
+        goal_state: Optional[Tuple[int, int, int]] = None
+        expansions = 0
+        max_expansions = max(2500, rows * cols * 2)
 
         while open_heap:
             _, _, current = heapq.heappop(open_heap)
-            if current == goal:
+            expansions += 1
+            if (current[0], current[1]) == goal and self._goal_heading_ok(current[2], goal_heading):
+                goal_state = current
                 break
-            for dr, dc, move_cost in motions:
-                nxt = (current[0] + dr, current[1] + dc)
+            if expansions > max_expansions:
+                break
+            for turn in (-1, 0, 1):
+                next_heading = (current[2] + turn) % len(heading_moves)
+                dr, dc, _ = heading_moves[next_heading]
+                nxt = (current[0] + dr, current[1] + dc, next_heading)
                 if not (0 <= nxt[0] < rows and 0 <= nxt[1] < cols):
                     continue
                 if blocked[nxt[0]][nxt[1]]:
                     continue
-                new_cost = cost_so_far[current] + move_cost
+                move_cost = math.hypot(dr, dc)
+                turn_penalty = 0.55 * abs(turn)
+                heading_penalty = 0.0
+                if goal_heading is not None:
+                    heading_penalty = 0.05 * self._heading_index_distance(next_heading, goal_heading)
+                new_cost = cost_so_far[current] + move_cost + turn_penalty + heading_penalty
                 if new_cost >= cost_so_far.get(nxt, float("inf")):
                     continue
                 cost_so_far[nxt] = new_cost
@@ -409,17 +448,29 @@ class PlannerSkeleton:
                 heapq.heappush(open_heap, (new_cost + heuristic, new_cost, nxt))
                 came_from[nxt] = current
 
-        if goal not in came_from and goal != start:
+        if goal_state is None:
             return []
 
-        cells = [goal]
-        while cells[-1] != start:
-            cells.append(came_from[cells[-1]])
-        cells.reverse()
+        states = [goal_state]
+        while states[-1] != start_state:
+            states.append(came_from[states[-1]])
+        states.reverse()
         path = [start_xy]
-        path.extend(to_world(cell) for cell in cells[1:-1])
+        path.extend(to_world((state[0], state[1])) for state in states[1:-1])
         path.append(goal_xy)
         return path
+
+    def _heading_index(self, yaw: float) -> int:
+        return int(round(self._wrap_to_pi(yaw) / (math.pi / 4.0))) % 8
+
+    def _heading_index_distance(self, a: int, b: int) -> int:
+        diff = abs(a - b) % 8
+        return min(diff, 8 - diff)
+
+    def _goal_heading_ok(self, heading: int, goal_heading: Optional[int]) -> bool:
+        if goal_heading is None:
+            return True
+        return self._heading_index_distance(heading, goal_heading) <= 1
 
     def _cached_blocked_grid(self, rows: int, cols: int, grid_step: float) -> List[List[bool]]:
         if (
@@ -653,6 +704,16 @@ class PlannerSkeleton:
         xmin, xmax, ymin, ymax = self.map_extent
         margin = max(margin, CAR_CLEARANCE_RADIUS + EXTRA_SAFETY_MARGIN)
         return xmin + margin <= x <= xmax - margin and ymin + margin <= y <= ymax - margin
+
+    def _clamp_inside_map(self, x: float, y: float, margin: float = 0.4) -> Tuple[float, float]:
+        if self.map_extent is None:
+            return x, y
+        xmin, xmax, ymin, ymax = self.map_extent
+        margin = max(margin, CAR_CLEARANCE_RADIUS + EXTRA_SAFETY_MARGIN)
+        return (
+            max(xmin + margin, min(xmax - margin, x)),
+            max(ymin + margin, min(ymax - margin, y)),
+        )
 
     def _path_length(self, path: List[Tuple[float, float]]) -> float:
         if len(path) < 2:
