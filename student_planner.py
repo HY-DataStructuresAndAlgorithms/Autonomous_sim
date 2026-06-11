@@ -325,7 +325,7 @@ class PlannerSkeleton:
         cx = 0.5 * (float(slot[0]) + float(slot[1]))
         cy = 0.5 * (float(slot[2]) + float(slot[3]))
         slot_len = abs(float(slot[3]) - float(slot[2]))
-        offset = max(2.5, slot_len * 0.75)
+        offset = max(4.0, slot_len * 1.1)
         return cx - math.cos(target_yaw) * offset, cy - math.sin(target_yaw) * offset, target_yaw
 
     def _approach_candidates(
@@ -339,16 +339,19 @@ class PlannerSkeleton:
         slot_l = abs(float(slot[3]) - float(slot[2]))
         forward = (math.cos(target_yaw), math.sin(target_yaw))
         lateral = (-math.sin(target_yaw), math.cos(target_yaw))
-        distances = [max(2.6, slot_l * 0.75), max(3.6, slot_l)]
-        lateral_offsets = [0.0, 0.35 * slot_w, -0.35 * slot_w]
+        distances = [max(4.0, slot_l * 1.0), max(5.5, slot_l * 1.3)]
+        lateral_offsets = [0.0, 0.20 * slot_w, -0.20 * slot_w]
         candidates: List[Tuple[float, float, float]] = []
-        for side in (1.0, -1.0):
-            for distance in distances:
-                for lateral_offset in lateral_offsets:
-                    ax = cx - side * forward[0] * distance + lateral[0] * lateral_offset
-                    ay = cy - side * forward[1] * distance + lateral[1] * lateral_offset
-                    if self._inside_map(ax, ay):
-                        candidates.append((ax, ay, target_yaw))
+        for distance in distances:
+            for lateral_offset in lateral_offsets:
+                ax = cx - forward[0] * distance + lateral[0] * lateral_offset
+                ay = cy - forward[1] * distance + lateral[1] * lateral_offset
+                if not self._inside_map(ax, ay):
+                    ax, ay = self._clamp_inside_map(ax, ay)
+                if self._estimate_clearance((ax, ay), include_lines=True) > 0.20:
+                    candidate = (ax, ay, target_yaw)
+                    if all(math.hypot(ax - old[0], ay - old[1]) > 0.3 for old in candidates):
+                        candidates.append(candidate)
         if candidates:
             return candidates
         fallback = self._clamp_inside_map(*self._approach_pose(slot, target_yaw)[:2])
@@ -377,7 +380,17 @@ class PlannerSkeleton:
             final_leg = math.hypot(target_pose[0] - candidate[0], target_pose[1] - candidate[1])
             yaw_align = abs(self._wrap_to_pi(candidate[2] - target_pose[2]))
             clearance_penalty = 8.0 / max(clearance, 0.20)
-            cost = path_len + 0.65 * final_leg + 2.0 * yaw_align + clearance_penalty
+            lateral_error = abs(
+                (candidate[0] - target_pose[0]) * math.sin(target_pose[2])
+                - (candidate[1] - target_pose[1]) * math.cos(target_pose[2])
+            )
+            cost = (
+                path_len
+                + 0.65 * final_leg
+                + 2.0 * yaw_align
+                + 2.5 * lateral_error
+                + clearance_penalty
+            )
             if best is None or cost < best[2]:
                 best = (candidate, grid_path, cost)
             if best is not None and time.perf_counter() - started_at > 0.08:
@@ -394,7 +407,7 @@ class PlannerSkeleton:
         points = list(approach_path)
         tx, ty, target_yaw = target_pose
         forward = (math.cos(target_yaw), math.sin(target_yaw))
-        alignment_distances = [2.2, 1.2, 0.45, 0.0]
+        alignment_distances = [4.0, 3.0, 2.0, 1.2, 0.45, 0.0]
         for distance in alignment_distances:
             if distance == 0.0:
                 point = (tx, ty)
@@ -402,8 +415,6 @@ class PlannerSkeleton:
                     points.append(point)
                 continue
             point = (tx - forward[0] * distance, ty - forward[1] * distance)
-            if not self._inside_map(point[0], point[1], margin=0.2):
-                point = (tx + forward[0] * distance, ty + forward[1] * distance)
             if not self._inside_map(point[0], point[1], margin=0.2):
                 point = self._clamp_inside_map(point[0], point[1], margin=0.2)
             if math.hypot(point[0] - points[-1][0], point[1] - points[-1][1]) > 0.25:
