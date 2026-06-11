@@ -36,12 +36,12 @@ USE_RL_SPEED_CONTROL = os.getenv("PARKING_USE_RL_SPEED", "1").lower() not in {
     "no",
 }
 VEHICLE_LONGEST_LENGTH = 3.0
-CAR_CLEARANCE_RADIUS = 0.5 * VEHICLE_LONGEST_LENGTH * 1.20
-PLANNING_OBSTACLE_MARGIN = CAR_CLEARANCE_RADIUS
+VEHICLE_BOUNDARY_DIAMETER = VEHICLE_LONGEST_LENGTH * 1.20
+VEHICLE_CENTER_CLEARANCE = 0.5 * VEHICLE_BOUNDARY_DIAMETER
+PLANNING_OBSTACLE_MARGIN = VEHICLE_CENTER_CLEARANCE
 EXTRA_SAFETY_MARGIN = 0.0
 OBSTACLE_SLOW_DISTANCE = 1.15
 OBSTACLE_STOP_DISTANCE = 0.45
-STEER_COMMAND_LIMIT_RATIO = 0.82
 
 
 def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
@@ -675,8 +675,7 @@ class PlannerSkeleton:
         steer = math.atan2(2.0 * wheelbase * math.sin(alpha), lookahead)
         if reverse:
             steer = -steer
-        command_limit = max_steer * STEER_COMMAND_LIMIT_RATIO
-        return max(-command_limit, min(command_limit, steer))
+        return max(-max_steer, min(max_steer, steer))
 
     def _target_speed(
         self,
@@ -702,14 +701,14 @@ class PlannerSkeleton:
         if self.map_extent is None:
             return True
         xmin, xmax, ymin, ymax = self.map_extent
-        margin = max(margin, CAR_CLEARANCE_RADIUS + EXTRA_SAFETY_MARGIN)
+        margin = max(margin, VEHICLE_CENTER_CLEARANCE + EXTRA_SAFETY_MARGIN)
         return xmin + margin <= x <= xmax - margin and ymin + margin <= y <= ymax - margin
 
     def _clamp_inside_map(self, x: float, y: float, margin: float = 0.4) -> Tuple[float, float]:
         if self.map_extent is None:
             return x, y
         xmin, xmax, ymin, ymax = self.map_extent
-        margin = max(margin, CAR_CLEARANCE_RADIUS + EXTRA_SAFETY_MARGIN)
+        margin = max(margin, VEHICLE_CENTER_CLEARANCE + EXTRA_SAFETY_MARGIN)
         return (
             max(xmin + margin, min(xmax - margin, x)),
             max(ymin + margin, min(ymax - margin, y)),
@@ -743,7 +742,7 @@ class PlannerSkeleton:
             dx = max(rx0 - px, 0.0, px - rx1)
             dy = max(ry0 - py, 0.0, py - ry1)
             best = min(best, math.hypot(dx, dy))
-        return max(0.0, best - CAR_CLEARANCE_RADIUS - EXTRA_SAFETY_MARGIN)
+        return max(0.0, best - VEHICLE_CENTER_CLEARANCE - EXTRA_SAFETY_MARGIN)
 
     def _log_evaluation(
         self,
