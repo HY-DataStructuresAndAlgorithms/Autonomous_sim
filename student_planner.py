@@ -39,6 +39,8 @@ OBSTACLE_STOP_DISTANCE = 0.45
 FRONT_CLEAR_DISTANCE = 6.0
 FRONT_CLEAR_SPEED_BONUS = 0.75
 PARKING_ALIGN_DISTANCE = 4.0
+FINAL_ALIGNMENT_DISTANCES = (3.4, 2.4, 1.45, 0.75, 0.35, 0.0)
+FINAL_ALIGN_CLEARANCE_MIN = 0.10
 PARKING_REVERSE_YAW_ERROR = math.radians(32.0)
 PARKING_REVERSE_TICKS = 58
 PARKING_REVERSE_COOLDOWN_TICKS = 45
@@ -173,8 +175,15 @@ class PlannerSkeleton:
             )
 
         simplified = self._simplify_path(grid_path, spacing=1.0)
+        parking_start_index = max(0, len(simplified) - 1)
         points = self._append_final_alignment(simplified, target_pose)
-        self.waypoints = self._points_to_waypoints(points, final_yaw=target_pose[2], gear="D")
+        self.waypoints = self._points_to_waypoints(
+            points,
+            final_yaw=target_pose[2],
+            gear="D",
+            target_pose=target_pose,
+            parking_start_index=parking_start_index,
+        )
 
         initial_clearance = self._estimate_min_obstacle_distance((start[0], start[1]))
         self.min_obstacle_distance = min(self.min_obstacle_distance, initial_clearance)
@@ -279,6 +288,7 @@ class PlannerSkeleton:
             self.parking_reverse_cooldown -= 1
         should_reverse_for_alignment = (
             not self.parking_has_reversed
+            and target_wp[3] != "R"
             and final_yaw_error > PARKING_REVERSE_YAW_ERROR
         )
         forward_after_reverse = 0.0
@@ -333,8 +343,14 @@ class PlannerSkeleton:
             gear = "R"
             reverse_realigning = True
         elif in_parking_mode:
-            target_wp = (target_center[0], target_center[1], final_wp[2], "D")
-            gear = "D"
+            target_wp = self._parking_entry_target(
+                x=x,
+                y=y,
+                planned_target=target_wp,
+                target_center=target_center,
+                final_yaw=final_wp[2],
+            )
+            gear = target_wp[3]
         if in_parking_mode:
             control_yaw_error = final_yaw_error
         else:
@@ -552,20 +568,61 @@ class PlannerSkeleton:
             return [(target_pose[0], target_pose[1])]
         points = list(approach_path)
         tx, ty, target_yaw = target_pose
-        approach_side = 1.0 if points[-1][1] >= ty else -1.0
-        alignment_distances = [3.0, 2.0, 1.2, 0.45, 0.0]
-        for distance in alignment_distances:
+        axis_x = math.cos(target_yaw)
+        axis_y = math.sin(target_yaw)
+        lateral_x = -axis_y
+        lateral_y = axis_x
+        last_x, last_y = points[-1]
+        rel_x = last_x - tx
+        rel_y = last_y - ty
+        along = rel_x * axis_x + rel_y * axis_y
+        lateral = rel_x * lateral_x + rel_y * lateral_y
+        approach_side = 1.0 if along >= 0.0 else -1.0
+
+        # First pull the final leg onto the slot centerline. This prevents the
+        # parking controller from entering the slot diagonally after A* reaches
+        # the 1st approach point.
+        if abs(lateral) > 0.20:
+            centerline_distance = max(2.8, min(abs(along), FINAL_ALIGNMENT_DISTANCES[0]))
+            centerline_point = (
+                tx + approach_side * axis_x * centerline_distance,
+                ty + approach_side * axis_y * centerline_distance,
+            )
+            centerline_point = self._safe_alignment_point(centerline_point)
+            if math.hypot(
+                centerline_point[0] - points[-1][0],
+                centerline_point[1] - points[-1][1],
+            ) > 0.25:
+                points.append(centerline_point)
+
+        current_entry_distance = abs(
+            (points[-1][0] - tx) * axis_x + (points[-1][1] - ty) * axis_y
+        )
+        for distance in FINAL_ALIGNMENT_DISTANCES:
             if distance == 0.0:
                 point = (tx, ty)
                 if math.hypot(point[0] - points[-1][0], point[1] - points[-1][1]) > 0.25:
                     points.append(point)
                 continue
-            point = (tx, ty + approach_side * distance)
-            if not self._inside_map(point[0], point[1], margin=0.2):
-                point = self._clamp_inside_map(point[0], point[1], margin=0.2)
+            if distance >= current_entry_distance - 0.20:
+                continue
+            point = (
+                tx + approach_side * axis_x * distance,
+                ty + approach_side * axis_y * distance,
+            )
+            point = self._safe_alignment_point(point)
             if math.hypot(point[0] - points[-1][0], point[1] - points[-1][1]) > 0.25:
                 points.append(point)
+                current_entry_distance = distance
         return points
+
+    def _safe_alignment_point(self, point: Tuple[float, float]) -> Tuple[float, float]:
+        x, y = point
+        if not self._inside_map(x, y, margin=0.2):
+            x, y = self._clamp_inside_map(x, y, margin=0.2)
+        if self._estimate_min_obstacle_distance((x, y)) >= FINAL_ALIGN_CLEARANCE_MIN:
+            return x, y
+        return point
 
     def _astar_path(
         self,
@@ -897,15 +954,32 @@ class PlannerSkeleton:
         points: List[Tuple[float, float]],
         final_yaw: float,
         gear: str,
+        target_pose: Optional[Tuple[float, float, float]] = None,
+        parking_start_index: Optional[int] = None,
     ) -> List[Waypoint]:
         waypoints: List[Waypoint] = []
         for idx, point in enumerate(points):
+            segment_gear = gear
             if idx < len(points) - 1:
                 nxt = points[idx + 1]
                 yaw = math.atan2(nxt[1] - point[1], nxt[0] - point[0])
+                if target_pose is not None and (
+                    parking_start_index is None or idx >= parking_start_index
+                ):
+                    tx, ty, target_yaw = target_pose
+                    near_target = (
+                        math.hypot(point[0] - tx, point[1] - ty) <= PARKING_ALIGN_DISTANCE + 0.5
+                        and math.hypot(nxt[0] - tx, nxt[1] - ty) <= PARKING_ALIGN_DISTANCE + 0.5
+                    )
+                    if near_target:
+                        travel_dot = math.cos(self._wrap_to_pi(yaw - target_yaw))
+                        yaw = target_yaw
+                        segment_gear = "D" if travel_dot >= 0.0 else "R"
             else:
                 yaw = final_yaw
-            waypoints.append((point[0], point[1], yaw, gear))
+                if waypoints:
+                    segment_gear = waypoints[-1][3]
+            waypoints.append((point[0], point[1], yaw, segment_gear))
         return waypoints
 
     def _advance_waypoint_index(self, x: float, y: float) -> None:
@@ -981,6 +1055,19 @@ class PlannerSkeleton:
         ty = target_center[1] - math.sin(target_yaw) * backout_distance
         tx, ty = self._clamp_inside_map(tx, ty, margin=0.2)
         return tx, ty, target_yaw, "R"
+
+    def _parking_entry_target(
+        self,
+        x: float,
+        y: float,
+        planned_target: Waypoint,
+        target_center: Tuple[float, float],
+        final_yaw: float,
+    ) -> Waypoint:
+        final_dist = math.hypot(target_center[0] - x, target_center[1] - y)
+        if final_dist < 1.0:
+            return target_center[0], target_center[1], final_yaw, planned_target[3]
+        return planned_target[0], planned_target[1], final_yaw, planned_target[3]
 
     def _target_speed(
         self,
