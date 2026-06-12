@@ -1,0 +1,2365 @@
+"""Student parking planner.
+
+Only this file is intended to be edited by students. The simulator sends a
+static map once, then sends observation packets every tick. `planner_step`
+returns the command dictionary expected by the provided IPC client:
+
+    {"steer": radians, "accel": 0..1, "brake": 0..1, "gear": "D" or "R"}
+
+This implementation is a minimum working baseline:
+- A* plans a collision-aware path from the current vehicle position to an
+  approach point near the target parking slot.
+- A short final segment moves into the slot center with the desired yaw.
+- Pure Pursuit tracks the waypoint path.
+- Simple proportional speed control slows near the slot, obstacles, and sharp
+  turns.
+"""
+
+from __future__ import annotations
+
+import heapq
+import json
+import math
+import os
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+from rl_speed_controller import RLSpeedController
+
+
+Waypoint = Tuple[float, float, float, str]  # x, y, desired yaw, gear
+USE_RL_SPEED_CONTROL = os.getenv("PARKING_USE_RL_SPEED", "0").lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
+USE_ASYNC_PLANNING = os.getenv("PARKING_ASYNC_PLANNER", "1").lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
+VEHICLE_LONGEST_LENGTH = 3.0
+VEHICLE_BOUNDARY_DIAMETER = VEHICLE_LONGEST_LENGTH * 1.20
+VEHICLE_CENTER_CLEARANCE = 0.5 * VEHICLE_BOUNDARY_DIAMETER
+PLANNING_OBSTACLE_MARGIN = VEHICLE_CENTER_CLEARANCE
+EXTRA_SAFETY_MARGIN = 0.0
+OBSTACLE_SLOW_DISTANCE = 1.15
+OBSTACLE_STOP_DISTANCE = 0.45
+FRONT_CLEAR_DISTANCE = 6.0
+FRONT_CLEAR_SPEED_BONUS = 0.75
+PARKING_ALIGN_DISTANCE = 4.0
+PARKING_REVERSE_YAW_ERROR = math.radians(32.0)
+PARKING_REVERSE_TICKS = 58
+PARKING_REVERSE_COOLDOWN_TICKS = 45
+PARKING_REVERSE_WALL_CLEARANCE = 0.85
+PARKING_TARGET_OVERSHOOT = 0.30
+LINE_EXTRA_CLEARANCE = PLANNING_OBSTACLE_MARGIN * 0.20
+GUIDED_LINE_FOOTPRINT_MARGIN = 1.20
+TERMINAL_XY_RESOLUTION = 1.0
+TERMINAL_YAW_RESOLUTION = math.radians(30.0)
+TERMINAL_PRIMITIVE_LENGTH = 1.5
+TERMINAL_PRIMITIVE_STEPS = 6
+TERMINAL_MAX_ITERATIONS = 4500
+GEAR_TRANSITION_RADIUS = 0.85
+GEAR_TRANSITION_YAW_TOLERANCE = math.radians(22.0)
+SEMANTIC_ENTRY_BONUS = 3.0
+FALLBACK_ENTRY_PENALTY = 4.0
+PREVIEW_MAX_TIME = 22.0
+PREVIEW_DT = 0.10
+PREVIEW_MAX_ACCEL = 2.8
+PREVIEW_MAX_BRAKE = 4.5
+PREVIEW_STEER_RATE = math.radians(240.0)
+
+
+def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
+    extent = map_payload.get("extent") or [None, None, None, None]
+    slots = map_payload.get("slots") or []
+    occupied = map_payload.get("occupied_idx") or []
+    free_slots = len(slots) - sum(1 for v in occupied if v)
+    print("[algo] map extent :", extent)
+    print("[algo] total slots:", len(slots), "/ free:", free_slots)
+    stationary = map_payload.get("grid", {}).get("stationary")
+    if stationary:
+        rows = len(stationary)
+        cols = len(stationary[0]) if stationary else 0
+        print("[algo] grid size  :", rows, "x", cols)
+
+
+@dataclass
+class EntryPlan:
+    sign: float
+    semantic_match: bool
+    fallback_used: bool
+    score: float
+    preview_reason: str
+    preview_iou_proxy: float
+    grid_cost: float
+    hybrid_start_index: int
+    waypoints: List[Waypoint]
+
+
+@dataclass
+class PlannerSkeleton:
+    """Rule-based planner and controller fitted to the existing simulator API."""
+
+    map_data: Optional[Dict[str, Any]] = None
+    map_extent: Optional[Tuple[float, float, float, float]] = None
+    cell_size: float = 0.5
+    stationary_grid: Optional[List[List[float]]] = None
+    waypoints: List[Waypoint] = None
+    waypoint_index: int = 0
+    target_signature: Optional[Tuple[float, ...]] = None
+    last_log_time: float = -999.0
+    step_count: int = 0
+    min_obstacle_distance: float = float("inf")
+    rl_speed: RLSpeedController = None
+    last_eval_log_time: float = -999.0
+    final_eval_logged: bool = False
+    planning_fail_reason: Optional[str] = None
+    blocked_grid_cache: Optional[Tuple[int, int, float, List[List[bool]]]] = None
+    line_penalty_grid_cache: Optional[Tuple[int, int, float, List[List[float]]]] = None
+    parking_reverse_ticks: int = 0
+    parking_reverse_cooldown: int = 0
+    parking_has_reversed: bool = False
+    hybrid_start_index: int = 10**9
+    current_yaw_for_progress: float = 0.0
+    planning_thread: Optional[threading.Thread] = None
+    planning_signature: Optional[Tuple[float, ...]] = None
+    planning_started_at: float = -999.0
+    last_command_gear: str = "D"
+
+    def __post_init__(self) -> None:
+        if self.waypoints is None:
+            self.waypoints = []
+        if self.rl_speed is None:
+            self.rl_speed = RLSpeedController(enabled=USE_RL_SPEED_CONTROL)
+
+    def set_map(self, map_payload: Dict[str, Any]) -> None:
+        """Store static map data sent by the simulator."""
+
+        self.map_data = map_payload
+        self.map_extent = tuple(
+            map(float, map_payload.get("extent", (0.0, 0.0, 0.0, 0.0)))
+        )
+        self.cell_size = float(map_payload.get("cellSize", 0.5))
+        self.stationary_grid = map_payload.get("grid", {}).get("stationary")
+        pretty_print_map_summary(map_payload)
+        self.waypoints.clear()
+        self.waypoint_index = 0
+        self.target_signature = None
+        self.last_log_time = -999.0
+        self.step_count = 0
+        self.min_obstacle_distance = float("inf")
+        self.last_eval_log_time = -999.0
+        self.final_eval_logged = False
+        self.planning_fail_reason = None
+        self.blocked_grid_cache = None
+        self.line_penalty_grid_cache = None
+        self.parking_reverse_ticks = 0
+        self.parking_reverse_cooldown = 0
+        self.parking_has_reversed = False
+        self.hybrid_start_index = 10**9
+        self.current_yaw_for_progress = 0.0
+        self.planning_thread = None
+        self.planning_signature = None
+        self.planning_started_at = -999.0
+        self.last_command_gear = "D"
+        self.rl_speed = RLSpeedController(enabled=USE_RL_SPEED_CONTROL)
+        self._warm_planning_caches()
+        print(f"[algo] rl_speed_control={'ON' if USE_RL_SPEED_CONTROL else 'OFF'}")
+
+    def compute_path(self, obs: Dict[str, Any]) -> None:
+        """Plan a path from the current pose to the target parking slot."""
+
+        self.waypoints.clear()
+        self.waypoint_index = 0
+        self.parking_reverse_ticks = 0
+        self.parking_reverse_cooldown = 0
+        self.parking_has_reversed = False
+        self.hybrid_start_index = 10**9
+        self.last_command_gear = "D"
+        state = obs.get("state", {})
+        start = (
+            float(state.get("x", 0.0)),
+            float(state.get("y", 0.0)),
+            float(state.get("yaw", 0.0)),
+        )
+        slot = obs.get("target_slot") or []
+        if len(slot) != 4 or self.map_extent is None:
+            self.planning_fail_reason = "missing_target_or_map"
+            print("[algo] planning failed: missing target slot or map")
+            return
+
+        self.target_signature = tuple(round(float(v), 3) for v in slot)
+        target_pose = self._target_pose(slot)
+        guided_plan = self._semantic_guided_entry_plan(start, slot, target_pose, obs)
+        if guided_plan is None:
+            guided_plan = self._direct_semantic_entry_fallback(start, slot, target_pose)
+        if guided_plan is None:
+            self.planning_fail_reason = "semantic_guided_planner_failed"
+            print("[algo] planning failed: semantic-guided planner produced no candidate")
+            return
+
+        self.planning_fail_reason = None
+        self.waypoints = guided_plan.waypoints
+        self.hybrid_start_index = guided_plan.hybrid_start_index
+        initial_clearance = self._estimate_min_obstacle_distance((start[0], start[1]))
+        self.min_obstacle_distance = min(self.min_obstacle_distance, initial_clearance)
+        print(
+            "[algo] semantic-guided terminal plan:"
+            f" sign={guided_plan.sign:+.0f}"
+            f" semantic={'yes' if guided_plan.semantic_match else 'no'}"
+            f" fallback={'yes' if guided_plan.fallback_used else 'no'}"
+            f" preview={guided_plan.preview_reason}"
+            f" score={guided_plan.score:.2f}"
+            f" waypoints={len(self.waypoints)}"
+        )
+        return
+
+    def compute_control(self, obs: Dict[str, Any]) -> Dict[str, Any]:
+        """Return steering, acceleration, brake, and gear for one simulation tick."""
+
+        self.step_count += 1
+        state = obs.get("state", {})
+        x = float(state.get("x", 0.0))
+        y = float(state.get("y", 0.0))
+        yaw = float(state.get("yaw", 0.0))
+        speed = abs(float(state.get("v", 0.0)))
+        t = float(obs.get("t", 0.0))
+        limits = obs.get("limits", {})
+        wheelbase = float(limits.get("L", 2.6))
+        max_steer = float(limits.get("maxSteer", math.radians(35.0)))
+
+        slot = obs.get("target_slot") or []
+        signature = tuple(round(float(v), 3) for v in slot) if len(slot) == 4 else None
+        if not self.waypoints or signature != self.target_signature:
+            if USE_ASYNC_PLANNING:
+                self._ensure_async_path(obs, signature, t)
+            else:
+                self.compute_path(obs)
+
+        if not self.waypoints:
+            return {"steer": 0.0, "accel": 0.0, "brake": 0.8, "gear": "D"}
+        if self.hybrid_start_index < 10**9:
+            return self._guided_compute_control(obs)
+
+        final_wp = self.waypoints[-1]
+        if len(slot) == 4:
+            target_center = self._slot_center(slot)
+            final_dist = math.hypot(target_center[0] - x, target_center[1] - y)
+            center_tolerance = self._slot_center_tolerance(slot)
+            slot_entered = self._point_in_slot(slot, x, y, margin=0.05)
+        else:
+            target_center = (final_wp[0], final_wp[1])
+            final_dist = math.hypot(final_wp[0] - x, final_wp[1] - y)
+            center_tolerance = 0.55
+            slot_entered = False
+        final_yaw_error = abs(self._wrap_to_pi(final_wp[2] - yaw))
+        obstacle_dist = self._estimate_min_obstacle_distance((x, y))
+        self.min_obstacle_distance = min(self.min_obstacle_distance, obstacle_dist)
+        collision_risk = False
+
+        if final_dist <= center_tolerance and final_yaw_error < math.radians(14.0):
+            self._log_evaluation(
+                parking_success=True,
+                fail_reason="none",
+                final_position_error=final_dist,
+                final_yaw_error=final_yaw_error,
+                collision=collision_risk,
+                force=True,
+            )
+            if speed < 0.18:
+                print(
+                    "[algo] parking succeeded:"
+                    f" pos_error={final_dist:.2f}m"
+                    f" center_tolerance={center_tolerance:.2f}m"
+                    f" yaw_error={math.degrees(final_yaw_error):.1f}deg"
+                    f" steps={self.step_count}"
+                    f" min_obstacle_dist~{self.min_obstacle_distance:.2f}m"
+                )
+            return {"steer": 0.0, "accel": 0.0, "brake": 1.0, "gear": "D"}
+
+        self.current_yaw_for_progress = yaw
+        self._advance_waypoint_index(x, y)
+        lookahead = self._adaptive_lookahead(speed, final_dist, final_yaw_error)
+        target_idx = self._lookahead_index(x, y, lookahead=lookahead)
+        target_wp = self.waypoints[target_idx]
+        gear = target_wp[3]
+        in_parking_mode = final_dist < PARKING_ALIGN_DISTANCE
+        terminal_plan_active = self.waypoint_index >= self.hybrid_start_index
+        guided_plan_active = self.hybrid_start_index < 10**9
+        reverse_realigning = False
+        forward_clearance = self._estimate_forward_clearance(
+            x=x,
+            y=y,
+            yaw=yaw,
+            reverse=False,
+        )
+        target_overshot = self._passed_target_center(
+            x=x,
+            y=y,
+            target_center=target_center,
+            target_yaw=final_wp[2],
+            tolerance=max(center_tolerance, PARKING_TARGET_OVERSHOOT),
+        )
+        if not terminal_plan_active:
+            if self.parking_reverse_cooldown > 0:
+                self.parking_reverse_cooldown -= 1
+            should_reverse_for_alignment = (
+                not self.parking_has_reversed
+                and final_yaw_error > PARKING_REVERSE_YAW_ERROR
+            )
+            should_reverse_for_obstacle = forward_clearance < PARKING_REVERSE_WALL_CLEARANCE
+            should_reverse_after_forward = self.parking_has_reversed and (
+                should_reverse_for_obstacle or target_overshot
+            )
+            if (
+                in_parking_mode
+                and self.parking_reverse_ticks <= 0
+                and (self.parking_reverse_cooldown <= 0 or should_reverse_after_forward)
+                and (
+                    should_reverse_for_alignment
+                    or should_reverse_for_obstacle
+                    or should_reverse_after_forward
+                )
+                and final_dist > max(center_tolerance * 1.8, 0.35)
+            ):
+                self.parking_reverse_ticks = PARKING_REVERSE_TICKS
+                self.parking_has_reversed = True
+                reverse_reason = (
+                    "alignment"
+                    if should_reverse_for_alignment
+                    else "front_obstacle" if should_reverse_for_obstacle else "target_overshoot"
+                )
+                print(
+                    "[algo] parking recovery: reverse realignment"
+                    f" pos_error={final_dist:.2f}m"
+                    f" yaw_error={math.degrees(final_yaw_error):.1f}deg"
+                    f" reason={reverse_reason}"
+                    f" forward_clearance={forward_clearance:.2f}m"
+                    f" target_overshot={target_overshot}"
+                )
+            if in_parking_mode and self.parking_reverse_ticks > 0:
+                self.parking_reverse_ticks -= 1
+                if self.parking_reverse_ticks <= 0:
+                    self.parking_reverse_cooldown = PARKING_REVERSE_COOLDOWN_TICKS
+                target_wp = self._parking_reverse_target(target_center, final_wp[2])
+                gear = "R"
+                reverse_realigning = True
+            elif in_parking_mode:
+                target_wp = (target_center[0], target_center[1], final_wp[2], "D")
+                gear = "D"
+
+        steer = self._pure_pursuit_steer(
+            x=x,
+            y=y,
+            yaw=yaw,
+            target_x=target_wp[0],
+            target_y=target_wp[1],
+            wheelbase=wheelbase,
+            max_steer=max_steer,
+            reverse=(gear == "R"),
+        )
+        if reverse_realigning:
+            steer = 0.0
+
+        front_clearance = self._estimate_forward_clearance(
+            x=x,
+            y=y,
+            yaw=yaw,
+            reverse=(gear == "R"),
+        )
+        collision_risk = front_clearance < OBSTACLE_STOP_DISTANCE
+        if collision_risk and final_dist > 1.0:
+            self._log_evaluation(
+                parking_success=False,
+                fail_reason="front_collision_risk",
+                final_position_error=final_dist,
+                final_yaw_error=final_yaw_error,
+                collision=True,
+                current_time=t,
+            )
+            return {"steer": steer * 0.4, "accel": 0.0, "brake": 1.0, "gear": gear}
+
+        front_is_clear = front_clearance >= FRONT_CLEAR_DISTANCE
+        rule_speed = self._target_speed(
+            final_dist,
+            final_yaw_error,
+            steer,
+            front_clearance,
+        )
+        if guided_plan_active and final_dist < 8.0:
+            rule_speed = min(rule_speed, 0.75)
+        if guided_plan_active and final_dist < 5.0:
+            rule_speed = min(rule_speed, 0.45)
+        if terminal_plan_active:
+            rule_speed = min(rule_speed, 0.52)
+            if final_dist < 3.0:
+                rule_speed = min(rule_speed, 0.30)
+        if gear == "R":
+            rule_speed = min(rule_speed, 0.55)
+        target_speed = self.rl_speed.adjust_target_speed(
+            rule_speed=rule_speed,
+            final_dist=final_dist,
+            yaw_error=final_yaw_error,
+            steer_abs=abs(steer),
+            obstacle_dist=front_clearance,
+        )
+        straight_clear_full_accel = (
+            gear == "D"
+            and not in_parking_mode
+            and front_is_clear
+            and abs(steer) < math.radians(4.0)
+        )
+        accel, brake = self._speed_command(
+            speed=speed,
+            target_speed=target_speed,
+            front_is_clear=front_is_clear and final_dist > 3.0,
+            force_full_accel=straight_clear_full_accel,
+        )
+        self._log_evaluation(
+            parking_success=False,
+            fail_reason="front_collision_risk" if collision_risk else self.planning_fail_reason or "running",
+            final_position_error=final_dist,
+            final_yaw_error=final_yaw_error,
+            collision=collision_risk,
+            current_time=t,
+        )
+
+        if t - self.last_log_time > 2.0:
+            self.last_log_time = t
+            print(
+                "[algo] tracking:"
+                f" wp={self.waypoint_index}/{len(self.waypoints) - 1}"
+                f" pos_error={final_dist:.2f}m"
+                f" center_tolerance={center_tolerance:.2f}m"
+                f" slot_entered={slot_entered}"
+                f" yaw_error={math.degrees(final_yaw_error):.1f}deg"
+                f" min_obstacle_dist~{self.min_obstacle_distance:.2f}m"
+                f" front_clearance~{front_clearance:.2f}m"
+                f" gear={gear}"
+                f" lookahead={lookahead:.2f}m"
+                f" rule_speed={rule_speed:.2f}m/s"
+                f" speed={target_speed:.2f}m/s"
+                f" rl={'ON' if self.rl_speed.enabled else 'OFF'}"
+                f" rl_state={self.rl_speed.last_state}"
+                f" rl_action={self.rl_speed.last_action}"
+            )
+
+        return {"steer": steer, "accel": accel, "brake": brake, "gear": gear}
+
+    def _ensure_async_path(
+        self,
+        obs: Dict[str, Any],
+        signature: Optional[Tuple[float, ...]],
+        current_time: float,
+    ) -> None:
+        if signature is None:
+            return
+        if self.planning_thread is not None and self.planning_thread.is_alive():
+            if current_time - self.last_log_time > 1.0:
+                self.last_log_time = current_time
+                print("[algo] planning in background; holding brake")
+            return
+        if self.planning_signature == signature and self.waypoints:
+            return
+        self.planning_signature = signature
+        self.planning_started_at = time.perf_counter()
+        obs_copy = json.loads(json.dumps(obs))
+        self.planning_thread = threading.Thread(
+            target=self._async_compute_path,
+            args=(obs_copy, signature),
+            daemon=True,
+        )
+        self.planning_thread.start()
+        print("[algo] started background planning; holding brake")
+
+    def _async_compute_path(
+        self,
+        obs: Dict[str, Any],
+        signature: Tuple[float, ...],
+    ) -> None:
+        started = time.perf_counter()
+        try:
+            self.compute_path(obs)
+            elapsed = time.perf_counter() - started
+            if self.target_signature == signature and self.waypoints:
+                print(
+                    "[algo] background planning ready:"
+                    f" elapsed={elapsed:.2f}s waypoints={len(self.waypoints)}"
+                )
+        except Exception as exc:
+            self.planning_fail_reason = f"async_planning_error:{exc}"
+            print(f"[algo] background planning error: {exc}")
+
+    def _guided_compute_control(self, obs: Dict[str, Any]) -> Dict[str, Any]:
+        state = obs.get("state", {})
+        x = float(state.get("x", 0.0))
+        y = float(state.get("y", 0.0))
+        yaw = float(state.get("yaw", 0.0))
+        speed = abs(float(state.get("v", 0.0)))
+        t = float(obs.get("t", 0.0))
+        limits = obs.get("limits", {})
+        wheelbase = float(limits.get("L", 2.6))
+        max_steer = float(limits.get("maxSteer", math.radians(35.0)))
+
+        final_wp = self.waypoints[-1]
+        final_dist = math.hypot(final_wp[0] - x, final_wp[1] - y)
+        final_yaw_error = abs(self._wrap_to_pi(final_wp[2] - yaw))
+        obstacle_dist = self._estimate_clearance((x, y), include_lines=True)
+        self.min_obstacle_distance = min(self.min_obstacle_distance, obstacle_dist)
+        collision_risk = obstacle_dist < 0.08
+
+        if final_dist < 0.55 and final_yaw_error < math.radians(14.0):
+            self._log_evaluation(
+                parking_success=True,
+                fail_reason="none",
+                final_position_error=final_dist,
+                final_yaw_error=final_yaw_error,
+                collision=collision_risk,
+                force=True,
+            )
+            return {"steer": 0.0, "accel": 0.0, "brake": 1.0, "gear": "D"}
+
+        self.current_yaw_for_progress = yaw
+        self._advance_waypoint_index(x, y)
+        lookahead = self._guided_lookahead(speed, final_dist, final_yaw_error)
+        target_idx = self._guided_lookahead_index(x, y, lookahead)
+        target_wp = self.waypoints[target_idx]
+        gear = target_wp[3]
+
+        if gear != self.last_command_gear and speed > 0.12:
+            return {
+                "steer": 0.0,
+                "accel": 0.0,
+                "brake": 1.0,
+                "gear": self.last_command_gear,
+            }
+        self.last_command_gear = gear
+
+        steer = self._pure_pursuit_steer(
+            x=x,
+            y=y,
+            yaw=yaw,
+            target_x=target_wp[0],
+            target_y=target_wp[1],
+            wheelbase=wheelbase,
+            max_steer=max_steer,
+            reverse=(gear == "R"),
+        )
+
+        rule_speed = self._guided_target_speed(final_dist, final_yaw_error, steer, obstacle_dist)
+        target_speed = self.rl_speed.adjust_target_speed(
+            rule_speed=rule_speed,
+            final_dist=final_dist,
+            yaw_error=final_yaw_error,
+            steer_abs=abs(steer),
+            obstacle_dist=obstacle_dist,
+        )
+        accel, brake = self._speed_command(speed=speed, target_speed=target_speed)
+        self._log_evaluation(
+            parking_success=False,
+            fail_reason="collision_risk" if collision_risk else self.planning_fail_reason or "running",
+            final_position_error=final_dist,
+            final_yaw_error=final_yaw_error,
+            collision=collision_risk,
+            current_time=t,
+        )
+
+        if t - self.last_log_time > 2.0:
+            self.last_log_time = t
+            print(
+                "[algo] guided tracking:"
+                f" wp={self.waypoint_index}/{len(self.waypoints) - 1}"
+                f" pos_error={final_dist:.2f}m"
+                f" yaw_error={math.degrees(final_yaw_error):.1f}deg"
+                f" min_obstacle_dist~{self.min_obstacle_distance:.2f}m"
+                f" gear={gear}"
+                f" lookahead={lookahead:.2f}m"
+                f" rule_speed={rule_speed:.2f}m/s"
+                f" speed={target_speed:.2f}m/s"
+                f" rl={'ON' if self.rl_speed.enabled else 'OFF'}"
+            )
+
+        self.last_command_gear = gear
+        return {"steer": steer, "accel": accel, "brake": brake, "gear": gear}
+
+    def _guided_lookahead(self, speed: float, final_dist: float, yaw_error: float) -> float:
+        if self.waypoint_index >= self.hybrid_start_index:
+            return 0.65 if final_dist < 3.0 else 0.95
+        if final_dist > 18.0:
+            return 2.8
+        if final_dist > 8.0:
+            return 2.2
+        if final_dist > 3.0:
+            return 1.6
+        return 0.9
+
+    def _guided_lookahead_index(self, x: float, y: float, lookahead: float) -> int:
+        idx = min(self.waypoint_index, len(self.waypoints) - 1)
+        accum = math.hypot(self.waypoints[idx][0] - x, self.waypoints[idx][1] - y)
+        while idx < len(self.waypoints) - 1 and accum < lookahead:
+            a = self.waypoints[idx]
+            b = self.waypoints[idx + 1]
+            if a[3] != b[3]:
+                return idx
+            accum += math.hypot(b[0] - a[0], b[1] - a[1])
+            idx += 1
+        return idx
+
+    def _guided_target_speed(
+        self,
+        final_dist: float,
+        yaw_error: float,
+        steer: float,
+        obstacle_dist: float,
+    ) -> float:
+        target = 1.65
+        if final_dist < 8.0:
+            target = 0.95
+        if final_dist < 3.0:
+            target = 0.36
+        if abs(steer) > math.radians(27.0):
+            target = min(target, 0.75)
+        if obstacle_dist < 1.2:
+            target = min(target, 0.75)
+        if obstacle_dist < 0.55:
+            target = min(target, 0.35)
+        if self.waypoint_index >= self.hybrid_start_index:
+            target = min(target, 0.52)
+            if final_dist < 3.0:
+                target = min(target, 0.30)
+        return target
+
+    def _target_pose(self, slot: List[float]) -> Tuple[float, float, float]:
+        cx, cy = self._slot_center(slot)
+        expected = str((self.map_data or {}).get("expected_orientation") or "")
+        yaw = -math.pi / 2.0 if expected.lower().startswith("rear") else math.pi / 2.0
+        return cx, cy, yaw
+
+    def _slot_center(self, slot: List[float]) -> Tuple[float, float]:
+        return (
+            0.5 * (float(slot[0]) + float(slot[1])),
+            0.5 * (float(slot[2]) + float(slot[3])),
+        )
+
+    def _slot_center_tolerance(self, slot: List[float]) -> float:
+        slot_w = abs(float(slot[1]) - float(slot[0]))
+        slot_l = abs(float(slot[3]) - float(slot[2]))
+        return max(0.20, 0.10 * min(slot_w, slot_l))
+
+    def _point_in_slot(self, slot: List[float], x: float, y: float, margin: float = 0.0) -> bool:
+        return (
+            float(slot[0]) - margin <= x <= float(slot[1]) + margin
+            and float(slot[2]) - margin <= y <= float(slot[3]) + margin
+        )
+
+    def _passed_target_center(
+        self,
+        x: float,
+        y: float,
+        target_center: Tuple[float, float],
+        target_yaw: float,
+        tolerance: float,
+    ) -> bool:
+        dx = x - target_center[0]
+        dy = y - target_center[1]
+        along_target_axis = dx * math.cos(target_yaw) + dy * math.sin(target_yaw)
+        return along_target_axis > tolerance
+
+    def _approach_pose(self, slot: List[float], target_yaw: float) -> Tuple[float, float, float]:
+        cx, cy = self._slot_center(slot)
+        above = (cx, cy + 3.0, target_yaw)
+        if self._is_valid_approach_point(above[0], above[1]):
+            return above
+        return cx, cy - 3.0, target_yaw
+
+    def _approach_candidates(
+        self,
+        slot: List[float],
+        target_yaw: float,
+    ) -> List[Tuple[float, float, float]]:
+        cx, cy = self._slot_center(slot)
+        above = (cx, cy + 3.0, target_yaw)
+        below = (cx, cy - 3.0, target_yaw)
+        candidates: List[Tuple[float, float, float]] = []
+        if self._is_valid_approach_point(above[0], above[1]):
+            candidates.append(above)
+        elif self._is_valid_approach_point(below[0], below[1]):
+            candidates.append(below)
+        if candidates:
+            return candidates
+        fallback_x, fallback_y = self._clamp_inside_map(below[0], below[1])
+        return [(fallback_x, fallback_y, target_yaw)]
+
+    def _is_valid_approach_point(self, x: float, y: float) -> bool:
+        return self._inside_map(x, y) and self._estimate_min_obstacle_distance((x, y)) > 0.20
+
+    def _select_best_plan(
+        self,
+        start_xy: Tuple[float, float],
+        candidates: List[Tuple[float, float, float]],
+        target_pose: Tuple[float, float, float],
+        start_yaw: float,
+    ) -> Optional[Tuple[Tuple[float, float, float], List[Tuple[float, float]], float]]:
+        best: Optional[Tuple[Tuple[float, float, float], List[Tuple[float, float]], float]] = None
+        started_at = time.perf_counter()
+        for candidate in candidates:
+            grid_path = self._astar_path(
+                start_xy,
+                (candidate[0], candidate[1]),
+                start_yaw=start_yaw,
+                goal_yaw=candidate[2],
+            )
+            if not grid_path:
+                continue
+            path_len = self._path_length(grid_path)
+            clearance = self._estimate_min_obstacle_distance((candidate[0], candidate[1]))
+            final_leg = math.hypot(target_pose[0] - candidate[0], target_pose[1] - candidate[1])
+            yaw_align = abs(self._wrap_to_pi(candidate[2] - target_pose[2]))
+            clearance_penalty = 8.0 / max(clearance, 0.20)
+            lateral_error = abs(
+                (candidate[0] - target_pose[0]) * math.sin(target_pose[2])
+                - (candidate[1] - target_pose[1]) * math.cos(target_pose[2])
+            )
+            cost = (
+                path_len
+                + 0.65 * final_leg
+                + 2.0 * yaw_align
+                + 2.5 * lateral_error
+                + clearance_penalty
+            )
+            if best is None or cost < best[2]:
+                best = (candidate, grid_path, cost)
+            if best is not None and time.perf_counter() - started_at > 0.08:
+                break
+        return best
+
+    def _append_final_alignment(
+        self,
+        approach_path: List[Tuple[float, float]],
+        target_pose: Tuple[float, float, float],
+    ) -> List[Tuple[float, float]]:
+        if not approach_path:
+            return [(target_pose[0], target_pose[1])]
+        points = list(approach_path)
+        tx, ty, target_yaw = target_pose
+        approach_side = 1.0 if points[-1][1] >= ty else -1.0
+        alignment_distances = [3.0, 2.0, 1.2, 0.45, 0.0]
+        for distance in alignment_distances:
+            if distance == 0.0:
+                point = (tx, ty)
+                if math.hypot(point[0] - points[-1][0], point[1] - points[-1][1]) > 0.25:
+                    points.append(point)
+                continue
+            point = (tx, ty + approach_side * distance)
+            if not self._inside_map(point[0], point[1], margin=0.2):
+                point = self._clamp_inside_map(point[0], point[1], margin=0.2)
+            if math.hypot(point[0] - points[-1][0], point[1] - points[-1][1]) > 0.25:
+                points.append(point)
+        return points
+
+    def _semantic_guided_entry_plan(
+        self,
+        start: Tuple[float, float, float],
+        slot: List[float],
+        target_pose: Tuple[float, float, float],
+        obs: Dict[str, Any],
+    ) -> Optional[EntryPlan]:
+        semantic_sign = self._semantic_entry_sign(slot, target_pose[2])
+        plans: List[EntryPlan] = []
+        semantic_plan = self._build_entry_plan_for_sign(
+            semantic_sign,
+            semantic_sign,
+            start,
+            slot,
+            target_pose,
+            obs,
+        )
+        if semantic_plan is not None:
+            plans.append(semantic_plan)
+            if semantic_plan.preview_reason != "collision":
+                return semantic_plan
+        opposite_plan = self._build_entry_plan_for_sign(
+            -semantic_sign,
+            semantic_sign,
+            start,
+            slot,
+            target_pose,
+            obs,
+        )
+        if opposite_plan is not None:
+            plans.append(opposite_plan)
+        if not plans:
+            return None
+        non_collision_plans = [plan for plan in plans if plan.preview_reason != "collision"]
+        if non_collision_plans:
+            return min(non_collision_plans, key=lambda plan: plan.score)
+        return min(plans, key=lambda plan: plan.score)
+
+    def _direct_semantic_entry_fallback(
+        self,
+        start: Tuple[float, float, float],
+        slot: List[float],
+        target_pose: Tuple[float, float, float],
+    ) -> Optional[EntryPlan]:
+        semantic_sign = self._semantic_entry_sign(slot, target_pose[2])
+        candidates = self._entry_candidates_for_sign(slot, target_pose[2], semantic_sign)
+        if not candidates:
+            return None
+        approach_pose = candidates[0]
+        grid_path = [(start[0], start[1]), (approach_pose[0], approach_pose[1])]
+        waypoints = self._top_entry_waypoints_for_sign(grid_path, target_pose, semantic_sign)
+        return EntryPlan(
+            sign=semantic_sign,
+            semantic_match=True,
+            fallback_used=True,
+            score=1e6,
+            preview_reason="direct",
+            preview_iou_proxy=0.0,
+            grid_cost=0.0,
+            hybrid_start_index=max(0, len(grid_path) - 1),
+            waypoints=waypoints,
+        )
+
+    def _semantic_entry_sign(self, slot: List[float], target_yaw: float) -> float:
+        open_y_sign = self._open_side_y_sign(slot)
+        forward_y = math.sin(target_yaw)
+        if abs(forward_y) < 1e-6:
+            return 1.0
+        return 1.0 if open_y_sign * forward_y > 0.0 else -1.0
+
+    def _open_side_y_sign(self, slot: List[float]) -> float:
+        sx0, sx1, sy0, sy1 = (float(v) for v in slot)
+        cx = 0.5 * (sx0 + sx1)
+
+        def has_horizontal_line(side_y: float) -> bool:
+            for line in (self.map_data or {}).get("lines") or []:
+                if len(line) != 4:
+                    continue
+                x1, y1, x2, y2 = (float(v) for v in line)
+                if abs(y1 - y2) > 1e-6:
+                    continue
+                if abs(y1 - side_y) > 0.75:
+                    continue
+                if min(x1, x2) - 0.4 <= cx <= max(x1, x2) + 0.4:
+                    return True
+            return False
+
+        bottom_blocked = has_horizontal_line(sy0)
+        top_blocked = has_horizontal_line(sy1)
+        if bottom_blocked and not top_blocked:
+            return 1.0
+        if top_blocked and not bottom_blocked:
+            return -1.0
+        if self.map_extent is None:
+            return 1.0
+        _, _, ymin, ymax = self.map_extent
+        return 1.0 if ymax - sy1 >= sy0 - ymin else -1.0
+
+    def _entry_candidates_for_sign(
+        self,
+        slot: List[float],
+        target_yaw: float,
+        sign: float,
+    ) -> List[Tuple[float, float, float]]:
+        cx, cy = self._slot_center(slot)
+        slot_w = abs(float(slot[1]) - float(slot[0]))
+        slot_l = abs(float(slot[3]) - float(slot[2]))
+        forward = (math.cos(target_yaw), math.sin(target_yaw))
+        lateral = (-math.sin(target_yaw), math.cos(target_yaw))
+        distances = [max(3.0, slot_l * 0.9), max(4.4, slot_l * 1.15)]
+        lateral_offsets = [0.0, 0.35 * slot_w, -0.35 * slot_w]
+        candidates: List[Tuple[float, float, float]] = []
+        for distance in distances:
+            for lateral_offset in lateral_offsets:
+                ax = cx + sign * forward[0] * distance + lateral[0] * lateral_offset
+                ay = cy + sign * forward[1] * distance + lateral[1] * lateral_offset
+                if self._guided_inside_map(ax, ay, margin=0.5) and self._guided_clearance((ax, ay)) > 0.35:
+                    candidates.append((ax, ay, target_yaw))
+        if candidates:
+            return candidates
+        ax = cx + sign * forward[0] * max(2.8, slot_l * 0.85)
+        ay = cy + sign * forward[1] * max(2.8, slot_l * 0.85)
+        ax, ay = self._clamp_inside_map(ax, ay)
+        return [(ax, ay, target_yaw)]
+
+    def _select_guided_best_plan(
+        self,
+        start_xy: Tuple[float, float],
+        candidates: List[Tuple[float, float, float]],
+        target_pose: Tuple[float, float, float],
+    ) -> Optional[Tuple[Tuple[float, float, float], List[Tuple[float, float]], float]]:
+        if not candidates:
+            return None
+        tx, ty, target_yaw = target_pose
+
+        def rough(candidate: Tuple[float, float, float]) -> float:
+            ax, ay, _ = candidate
+            dist = math.hypot(ax - start_xy[0], ay - start_xy[1])
+            final_leg = math.hypot(tx - ax, ty - ay)
+            ray = self._approach_ray_error((ax, ay), target_pose)
+            lateral = self._target_axis_lateral_offset((ax, ay), target_pose)
+            clearance = self._guided_clearance((ax, ay))
+            return dist + 0.4 * final_leg + 3.0 * ray + 0.8 * lateral + 0.8 / max(clearance, 0.25)
+
+        best: Optional[Tuple[Tuple[float, float, float], List[Tuple[float, float]], float]] = None
+        for candidate in sorted(candidates, key=rough)[:3]:
+            grid_path = self._guided_astar_path(start_xy, (candidate[0], candidate[1]))
+            if not grid_path:
+                continue
+            path_len = self._path_length(grid_path)
+            final_leg = math.hypot(tx - candidate[0], ty - candidate[1])
+            clearance = min(
+                self._guided_path_clearance(grid_path),
+                self._guided_final_alignment_clearance((candidate[0], candidate[1]), target_pose),
+            )
+            ray_error = self._approach_ray_error((candidate[0], candidate[1]), target_pose)
+            lateral = self._target_axis_lateral_offset((candidate[0], candidate[1]), target_pose)
+            radial = abs(final_leg - 3.2)
+            entry_heading_error = self._entry_heading_error(grid_path, target_yaw)
+            join_turn = self._terminal_join_turn(grid_path, target_pose)
+            cost = (
+                1.10 * path_len
+                + 0.55 * final_leg
+                + 1.15 / max(clearance, 0.25)
+                + 3.4 * ray_error
+                + 0.75 * lateral
+                + 0.25 * radial
+                + 1.35 * entry_heading_error
+                + 0.75 * join_turn
+            )
+            if best is None or cost < best[2]:
+                best = (candidate, grid_path, cost)
+        return best
+
+    def _approach_ray_error(
+        self,
+        point: Tuple[float, float],
+        target_pose: Tuple[float, float, float],
+    ) -> float:
+        tx, ty, target_yaw = target_pose
+        phi = math.atan2(point[1] - ty, point[0] - tx)
+        desired = self._wrap_to_pi(target_yaw + math.pi)
+        return abs(self._wrap_to_pi(phi - desired))
+
+    def _target_axis_lateral_offset(
+        self,
+        point: Tuple[float, float],
+        target_pose: Tuple[float, float, float],
+    ) -> float:
+        tx, ty, target_yaw = target_pose
+        forward = (math.cos(target_yaw), math.sin(target_yaw))
+        rel = (point[0] - tx, point[1] - ty)
+        return abs(rel[0] * forward[1] - rel[1] * forward[0])
+
+    def _heading_of_last_segment(self, path: List[Tuple[float, float]]) -> Optional[float]:
+        for idx in range(len(path) - 1, 0, -1):
+            dx = path[idx][0] - path[idx - 1][0]
+            dy = path[idx][1] - path[idx - 1][1]
+            if math.hypot(dx, dy) > 1e-6:
+                return math.atan2(dy, dx)
+        return None
+
+    def _entry_heading_error(self, path: List[Tuple[float, float]], target_yaw: float) -> float:
+        heading = self._heading_of_last_segment(path)
+        if heading is None:
+            return 0.0
+        return abs(self._wrap_to_pi(heading - target_yaw))
+
+    def _terminal_join_turn(
+        self,
+        path: List[Tuple[float, float]],
+        target_pose: Tuple[float, float, float],
+    ) -> float:
+        incoming = self._heading_of_last_segment(path)
+        if incoming is None or not path:
+            return 0.0
+        tx, ty, target_yaw = target_pose
+        forward = (math.cos(target_yaw), math.sin(target_yaw))
+        first_alignment = (tx - forward[0] * 2.2, ty - forward[1] * 2.2)
+        approach = path[-1]
+        join_heading = math.atan2(first_alignment[1] - approach[1], first_alignment[0] - approach[0])
+        return abs(self._wrap_to_pi(join_heading - incoming))
+
+    def _guided_path_clearance(self, path: List[Tuple[float, float]]) -> float:
+        best = float("inf")
+        for idx in range(1, len(path)):
+            for sample in self._segment_samples(path[idx - 1], path[idx], spacing=0.5):
+                best = min(best, self._guided_clearance(sample))
+        return best
+
+    def _guided_final_alignment_clearance(
+        self,
+        approach: Tuple[float, float],
+        target_pose: Tuple[float, float, float],
+    ) -> float:
+        tx, ty, target_yaw = target_pose
+        forward = (math.cos(target_yaw), math.sin(target_yaw))
+        points = [approach]
+        points.extend(
+            (tx - forward[0] * distance, ty - forward[1] * distance)
+            for distance in (2.2, 1.2, 0.45, 0.0)
+        )
+        best = float("inf")
+        for idx in range(1, len(points)):
+            for sample in self._segment_samples(points[idx - 1], points[idx], spacing=0.35):
+                best = min(best, self._guided_clearance(sample))
+        return best
+
+    def _guided_astar_path(
+        self,
+        start_xy: Tuple[float, float],
+        goal_xy: Tuple[float, float],
+    ) -> List[Tuple[float, float]]:
+        if self.map_extent is None:
+            return []
+        xmin, xmax, ymin, ymax = self.map_extent
+        grid_step = max(self.cell_size, 0.75)
+        cols = max(1, int(math.ceil((xmax - xmin) / grid_step)))
+        rows = max(1, int(math.ceil((ymax - ymin) / grid_step)))
+        blocked = self._guided_blocked_grid(rows, cols, grid_step)
+
+        def to_cell(point: Tuple[float, float]) -> Tuple[int, int]:
+            px, py = point
+            col = int((px - xmin) / grid_step)
+            row = int((ymax - py) / grid_step)
+            return max(0, min(rows - 1, row)), max(0, min(cols - 1, col))
+
+        def to_world(cell: Tuple[int, int]) -> Tuple[float, float]:
+            row, col = cell
+            return xmin + (col + 0.5) * grid_step, ymax - (row + 0.5) * grid_step
+
+        start = to_cell(start_xy)
+        goal = to_cell(goal_xy)
+        self._clear_cell(blocked, start, radius=2)
+        self._clear_cell(blocked, goal, radius=3)
+        motions = [
+            (-1, 0, 1.0),
+            (1, 0, 1.0),
+            (0, -1, 1.0),
+            (0, 1, 1.0),
+            (-1, -1, 1.414),
+            (-1, 1, 1.414),
+            (1, -1, 1.414),
+            (1, 1, 1.414),
+        ]
+        open_heap: List[Tuple[float, float, Tuple[int, int]]] = []
+        heapq.heappush(open_heap, (0.0, 0.0, start))
+        came_from: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        cost_so_far: Dict[Tuple[int, int], float] = {start: 0.0}
+        while open_heap:
+            _, _, current = heapq.heappop(open_heap)
+            if current == goal:
+                break
+            for dr, dc, move_cost in motions:
+                nxt = (current[0] + dr, current[1] + dc)
+                if not (0 <= nxt[0] < rows and 0 <= nxt[1] < cols):
+                    continue
+                if blocked[nxt[0]][nxt[1]]:
+                    continue
+                new_cost = cost_so_far[current] + move_cost
+                if new_cost >= cost_so_far.get(nxt, float("inf")):
+                    continue
+                cost_so_far[nxt] = new_cost
+                heuristic = math.hypot(goal[0] - nxt[0], goal[1] - nxt[1])
+                heapq.heappush(open_heap, (new_cost + heuristic, new_cost, nxt))
+                came_from[nxt] = current
+        if goal not in came_from and goal != start:
+            return []
+        cells = [goal]
+        while cells[-1] != start:
+            cells.append(came_from[cells[-1]])
+        cells.reverse()
+        path = [start_xy]
+        path.extend(to_world(cell) for cell in cells[1:-1])
+        path.append(goal_xy)
+        return path
+
+    def _guided_blocked_grid(self, rows: int, cols: int, grid_step: float) -> List[List[bool]]:
+        blocked = [[False for _ in range(cols)] for _ in range(rows)]
+        for rect in self._obstacle_rects():
+            self._mark_rect(blocked, rect, grid_step, margin=0.85)
+        for rect in self._line_obstacle_rects(half_width=0.25):
+            self._mark_rect(blocked, rect, grid_step, margin=GUIDED_LINE_FOOTPRINT_MARGIN)
+        return self._inflate_blocked(blocked, radius_cells=0)
+
+    def _guided_clearance(self, point: Tuple[float, float]) -> float:
+        best = float("inf")
+        for rect in self._obstacle_rects() + self._line_obstacle_rects(half_width=0.25):
+            best = min(best, self._rect_distance(point, rect))
+        return best
+
+    def _guided_inside_map(self, x: float, y: float, margin: float = 0.4) -> bool:
+        if self.map_extent is None:
+            return True
+        xmin, xmax, ymin, ymax = self.map_extent
+        return xmin + margin <= x <= xmax - margin and ymin + margin <= y <= ymax - margin
+
+    def _rect_distance(
+        self,
+        point: Tuple[float, float],
+        rect: Tuple[float, float, float, float],
+    ) -> float:
+        px, py = point
+        rx0, rx1, ry0, ry1 = rect
+        dx = max(rx0 - px, 0.0, px - rx1)
+        dy = max(ry0 - py, 0.0, py - ry1)
+        return math.hypot(dx, dy)
+
+    def _segment_samples(
+        self,
+        a: Tuple[float, float],
+        b: Tuple[float, float],
+        spacing: float,
+    ) -> List[Tuple[float, float]]:
+        length = max(1e-9, math.hypot(b[0] - a[0], b[1] - a[1]))
+        steps = max(2, int(math.ceil(length / spacing)))
+        return [
+            (a[0] + (b[0] - a[0]) * idx / steps, a[1] + (b[1] - a[1]) * idx / steps)
+            for idx in range(steps + 1)
+        ]
+
+    def _build_entry_plan_for_sign(
+        self,
+        sign: float,
+        semantic_sign: float,
+        start: Tuple[float, float, float],
+        slot: List[float],
+        target_pose: Tuple[float, float, float],
+        obs: Dict[str, Any],
+    ) -> Optional[EntryPlan]:
+        candidates = self._entry_candidates_for_sign(slot, target_pose[2], sign)
+        best_plan = self._select_guided_best_plan(
+            (start[0], start[1]),
+            candidates,
+            target_pose,
+        )
+        if best_plan is None:
+            return None
+
+        approach_pose, grid_path, grid_cost = best_plan
+        simplified = self._simplify_path(grid_path, spacing=1.0)
+        if len(simplified) >= 2:
+            a = simplified[-2]
+            b = simplified[-1]
+            local_yaw = math.atan2(b[1] - a[1], b[0] - a[0])
+        else:
+            local_yaw = start[2]
+
+        limits = obs.get("limits", {})
+        wheelbase = float(limits.get("L", 2.6))
+        max_steer = float(limits.get("maxSteer", math.radians(35.0)))
+        pose_path = self._terminal_hybrid_astar(
+            (approach_pose[0], approach_pose[1], local_yaw),
+            target_pose,
+            tuple(float(v) for v in slot),
+            wheelbase=wheelbase,
+            max_steer=max_steer,
+        )
+
+        plan_options: List[EntryPlan] = []
+        semantic_match = sign == semantic_sign
+
+        if pose_path:
+            approach_waypoints = self._points_to_waypoints(simplified[:-1], final_yaw=local_yaw, gear="D")
+            hybrid_start_index = len(approach_waypoints)
+            waypoints = approach_waypoints + self._pose_path_to_waypoints(pose_path, target_pose)
+            waypoints, hybrid_start_index = self._add_start_stabilizer(
+                waypoints,
+                hybrid_start_index,
+                start,
+            )
+            preview_score, preview_reason, preview_iou_proxy = self._preview_waypoints(
+                waypoints,
+                hybrid_start_index,
+                start,
+                tuple(float(v) for v in slot),
+                wheelbase=wheelbase,
+                max_steer=max_steer,
+            )
+            score = preview_score + 0.025 * grid_cost
+            if semantic_match:
+                score -= SEMANTIC_ENTRY_BONUS
+            plan_options.append(
+                EntryPlan(
+                    sign=sign,
+                    semantic_match=semantic_match,
+                    fallback_used=False,
+                    score=score,
+                    preview_reason=preview_reason,
+                    preview_iou_proxy=preview_iou_proxy,
+                    grid_cost=grid_cost,
+                    hybrid_start_index=hybrid_start_index,
+                    waypoints=waypoints,
+                )
+            )
+
+        top_entry_waypoints = self._top_entry_waypoints_for_sign(simplified, target_pose, sign)
+        top_hybrid_start = 10**9
+        top_entry_waypoints, top_hybrid_start = self._add_start_stabilizer(
+            top_entry_waypoints,
+            top_hybrid_start,
+            start,
+        )
+        preview_score, preview_reason, preview_iou_proxy = self._preview_waypoints(
+            top_entry_waypoints,
+            top_hybrid_start,
+            start,
+            tuple(float(v) for v in slot),
+            wheelbase=wheelbase,
+            max_steer=max_steer,
+        )
+        score = preview_score + 0.025 * grid_cost + FALLBACK_ENTRY_PENALTY
+        if semantic_match:
+            score -= SEMANTIC_ENTRY_BONUS
+        plan_options.append(
+            EntryPlan(
+                sign=sign,
+                semantic_match=semantic_match,
+                fallback_used=True,
+                score=score,
+                preview_reason=preview_reason,
+                preview_iou_proxy=preview_iou_proxy,
+                grid_cost=grid_cost,
+                hybrid_start_index=top_hybrid_start,
+                waypoints=top_entry_waypoints,
+            )
+        )
+
+        non_collision = [plan for plan in plan_options if plan.preview_reason != "collision"]
+        if non_collision:
+            return min(non_collision, key=lambda plan: plan.score)
+        return min(plan_options, key=lambda plan: plan.score)
+
+    def _add_start_stabilizer(
+        self,
+        waypoints: List[Waypoint],
+        hybrid_start_index: int,
+        start: Tuple[float, float, float],
+    ) -> Tuple[List[Waypoint], int]:
+        if len(waypoints) < 3 or self.map_extent is None:
+            return waypoints, hybrid_start_index
+        sx, sy, syaw = start
+        xmin, _xmax, _ymin, ymax = self.map_extent
+        if sx > xmin + 9.0 or math.sin(syaw) < 0.5:
+            return waypoints, hybrid_start_index
+        anchor_y = self._initial_lane_clear_y(sx, sy)
+        if anchor_y is None:
+            return waypoints, hybrid_start_index
+        anchor_y = min(anchor_y, ymax - 1.0)
+        if anchor_y <= sy + 1.2:
+            return waypoints, hybrid_start_index
+        if not any(wp[1] >= anchor_y - 0.6 for wp in waypoints[1:]):
+            return waypoints, hybrid_start_index
+
+        anchor: Waypoint = (sx, anchor_y, syaw, "D")
+        stabilized: List[Waypoint] = [waypoints[0], anchor]
+        skipped_before_hybrid = 0
+        clearing_initial_row = True
+        for idx, wp in enumerate(waypoints[1:], start=1):
+            if clearing_initial_row and wp[1] < anchor_y - 0.6:
+                skipped_before_hybrid += 1
+                continue
+            clearing_initial_row = False
+            stabilized.append(wp)
+        if len(stabilized) < 4:
+            return waypoints, hybrid_start_index
+        if hybrid_start_index >= 10**9:
+            new_hybrid_start = hybrid_start_index
+        else:
+            new_hybrid_start = max(0, hybrid_start_index + 1 - skipped_before_hybrid)
+        return stabilized, new_hybrid_start
+
+    def _initial_lane_clear_y(self, x: float, y: float) -> Optional[float]:
+        required_y: Optional[float] = None
+        for line in (self.map_data or {}).get("lines") or []:
+            if len(line) != 4:
+                continue
+            x1, y1, x2, y2 = (float(v) for v in line)
+            if abs(x1 - x2) < 1e-6:
+                line_x = x1
+                low_y = min(y1, y2)
+                high_y = max(y1, y2)
+                if x + 2.0 <= line_x <= x + 9.0 and low_y - 1.0 <= y <= high_y + 1.0:
+                    required_y = max(required_y or y, high_y + 2.0)
+        return required_y
+
+    def _top_entry_waypoints_for_sign(
+        self,
+        approach_path: List[Tuple[float, float]],
+        target_pose: Tuple[float, float, float],
+        sign: float,
+    ) -> List[Waypoint]:
+        tx, ty, target_yaw = target_pose
+        forward = (math.cos(target_yaw), math.sin(target_yaw))
+        final_gear = "R" if sign > 0.0 else "D"
+        waypoints: List[Waypoint] = []
+        for idx, point in enumerate(approach_path):
+            if idx < len(approach_path) - 1:
+                nxt = approach_path[idx + 1]
+                yaw = math.atan2(nxt[1] - point[1], nxt[0] - point[0])
+            else:
+                yaw = target_yaw
+            waypoints.append((point[0], point[1], yaw, "D"))
+        for distance in (2.4, 1.6, 0.9, 0.35, 0.0):
+            point = (tx + sign * forward[0] * distance, ty + sign * forward[1] * distance)
+            if not self._inside_map(point[0], point[1], margin=0.2):
+                point = self._clamp_inside_map(point[0], point[1], margin=0.2)
+            if not waypoints or math.hypot(point[0] - waypoints[-1][0], point[1] - waypoints[-1][1]) > 0.25:
+                waypoints.append((point[0], point[1], target_yaw, final_gear))
+        return waypoints
+
+    def _terminal_hybrid_astar(
+        self,
+        start: Tuple[float, float, float],
+        target: Tuple[float, float, float],
+        target_slot: Tuple[float, float, float, float],
+        wheelbase: float,
+        max_steer: float,
+    ) -> List[Tuple[float, float, float, str]]:
+        if self.map_extent is None:
+            return []
+        tx, ty, tyaw = target
+        xmin, xmax, ymin, ymax = self.map_extent
+        steer_values = [-max_steer, 0.0, max_steer]
+        gears = ("D", "R")
+
+        def key_of(x: float, y: float, yaw: float, gear: str) -> Tuple[int, int, int, str]:
+            yaw_bin = int(round(self._wrap_to_pi(yaw) / TERMINAL_YAW_RESOLUTION))
+            return (
+                int(round((x - xmin) / TERMINAL_XY_RESOLUTION)),
+                int(round((y - ymin) / TERMINAL_XY_RESOLUTION)),
+                yaw_bin,
+                gear,
+            )
+
+        def heuristic(x: float, y: float, yaw: float) -> float:
+            dist = math.hypot(tx - x, ty - y)
+            yaw_err = abs(self._wrap_to_pi(tyaw - yaw))
+            return dist + (0.6 if dist > 6.0 else 1.8) * yaw_err
+
+        def is_goal(x: float, y: float, yaw: float) -> bool:
+            return math.hypot(tx - x, ty - y) < 0.75 and abs(self._wrap_to_pi(tyaw - yaw)) < math.radians(16.0)
+
+        start_key = key_of(start[0], start[1], start[2], "D")
+        open_heap: List[Tuple[float, float, int, Tuple[int, int, int, str]]] = []
+        counter = 0
+        heapq.heappush(open_heap, (heuristic(start[0], start[1], start[2]), 0.0, counter, start_key))
+        nodes: Dict[
+            Tuple[int, int, int, str],
+            Tuple[float, float, float, str, Optional[Tuple[int, int, int, str]], float],
+        ] = {start_key: (start[0], start[1], start[2], "D", None, 0.0)}
+        cost_so_far: Dict[Tuple[int, int, int, str], float] = {start_key: 0.0}
+        goal_key: Optional[Tuple[int, int, int, str]] = None
+
+        for _ in range(TERMINAL_MAX_ITERATIONS):
+            if not open_heap:
+                break
+            _, g, _, current_key = heapq.heappop(open_heap)
+            x, y, yaw, current_gear, _parent, _parent_steer = nodes[current_key]
+            if g > cost_so_far.get(current_key, float("inf")) + 1e-9:
+                continue
+            if is_goal(x, y, yaw):
+                goal_key = current_key
+                break
+            for gear in gears:
+                direction = 1.0 if gear == "D" else -1.0
+                for steer in steer_values:
+                    nxt = self._simulate_terminal_primitive(
+                        x,
+                        y,
+                        yaw,
+                        direction,
+                        steer,
+                        wheelbase,
+                        target_slot,
+                        collision_check=True,
+                    )
+                    if nxt is None:
+                        continue
+                    nx, ny, nyaw = nxt[-1]
+                    if not (xmin + 0.2 <= nx <= xmax - 0.2 and ymin + 0.2 <= ny <= ymax - 0.2):
+                        continue
+                    nkey = key_of(nx, ny, nyaw, gear)
+                    step_cost = TERMINAL_PRIMITIVE_LENGTH
+                    step_cost += 0.12 * abs(steer) / max(max_steer, 1e-6)
+                    if gear == "R":
+                        step_cost += 0.08
+                    if gear != current_gear:
+                        step_cost += 1.8
+                    new_g = g + step_cost
+                    if new_g >= cost_so_far.get(nkey, float("inf")):
+                        continue
+                    cost_so_far[nkey] = new_g
+                    nodes[nkey] = (nx, ny, nyaw, gear, current_key, steer)
+                    counter += 1
+                    heapq.heappush(open_heap, (new_g + heuristic(nx, ny, nyaw), new_g, counter, nkey))
+
+        if goal_key is None:
+            return []
+        key_path: List[Tuple[int, int, int, str]] = []
+        key: Optional[Tuple[int, int, int, str]] = goal_key
+        while key is not None:
+            key_path.append(key)
+            _x, _y, _yaw, _gear, parent, _steer = nodes[key]
+            key = parent
+        key_path.reverse()
+
+        path: List[Tuple[float, float, float, str]] = []
+        if not key_path:
+            return path
+        sx, sy, syaw, sgear, _parent, _steer = nodes[key_path[0]]
+        path.append((sx, sy, syaw, sgear))
+        for idx in range(1, len(key_path)):
+            parent_key = key_path[idx - 1]
+            child_key = key_path[idx]
+            px, py, pyaw, _pgear, _pparent, _psteer = nodes[parent_key]
+            _cx, _cy, _cyaw, child_gear, _cparent, child_steer = nodes[child_key]
+            direction = 1.0 if child_gear == "D" else -1.0
+            samples = self._simulate_terminal_primitive(
+                px,
+                py,
+                pyaw,
+                direction,
+                child_steer,
+                wheelbase,
+                target_slot,
+                collision_check=False,
+            )
+            if not samples:
+                return []
+            path.extend((x, y, yaw, child_gear) for x, y, yaw in samples[1:])
+        return path
+
+    def _simulate_terminal_primitive(
+        self,
+        x: float,
+        y: float,
+        yaw: float,
+        direction: float,
+        steer: float,
+        wheelbase: float,
+        target_slot: Tuple[float, float, float, float],
+        collision_check: bool,
+    ) -> Optional[List[Tuple[float, float, float]]]:
+        ds = direction * TERMINAL_PRIMITIVE_LENGTH / TERMINAL_PRIMITIVE_STEPS
+        nx, ny, nyaw = x, y, yaw
+        samples = [(nx, ny, nyaw)]
+        for _ in range(TERMINAL_PRIMITIVE_STEPS):
+            nx += ds * math.cos(nyaw)
+            ny += ds * math.sin(nyaw)
+            nyaw = self._wrap_to_pi(nyaw + (ds / max(wheelbase, 1e-6)) * math.tan(steer))
+            if collision_check and self._pose_collides(nx, ny, nyaw, target_slot):
+                return None
+            samples.append((nx, ny, nyaw))
+        return samples
+
+    def _pose_path_to_waypoints(
+        self,
+        pose_path: List[Tuple[float, float, float, str]],
+        target_pose: Tuple[float, float, float],
+    ) -> List[Waypoint]:
+        if not pose_path:
+            return []
+        waypoints: List[Waypoint] = []
+        last_point: Optional[Tuple[float, float]] = None
+        for x, y, yaw, gear in pose_path:
+            if last_point is not None and math.hypot(x - last_point[0], y - last_point[1]) < 0.35:
+                continue
+            waypoints.append((x, y, yaw, gear))
+            last_point = (x, y)
+        tx, ty, tyaw = target_pose
+        if math.hypot(waypoints[-1][0] - tx, waypoints[-1][1] - ty) > 0.2:
+            waypoints.append((tx, ty, tyaw, waypoints[-1][3]))
+        else:
+            x, y, _yaw, gear = waypoints[-1]
+            waypoints[-1] = (x, y, tyaw, gear)
+        return waypoints
+
+    def _preview_waypoints(
+        self,
+        waypoints: List[Waypoint],
+        hybrid_start_index: int,
+        start: Tuple[float, float, float],
+        target_slot: Tuple[float, float, float, float],
+        wheelbase: float,
+        max_steer: float,
+    ) -> Tuple[float, str, float]:
+        if not waypoints:
+            return 1e6, "no_waypoints", 0.0
+        x, y, yaw = start
+        v = 0.0
+        delta = 0.0
+        idx = 0
+        t = 0.0
+        best_iou_proxy = 0.0
+        move_dist = 0.0
+        prev_x, prev_y = x, y
+        gear_switches = 0
+        prev_gear = "D"
+        steer_flips = 0
+        prev_steer_sign = 0
+        while t <= PREVIEW_MAX_TIME:
+            final_wp = waypoints[-1]
+            final_dist = math.hypot(final_wp[0] - x, final_wp[1] - y)
+            final_yaw_error = abs(self._wrap_to_pi(final_wp[2] - yaw))
+            idx = self._preview_advance_index(waypoints, idx, x, y, yaw)
+            lookahead = self._preview_lookahead(idx, hybrid_start_index, abs(v), final_dist, final_yaw_error)
+            target_idx = self._preview_lookahead_index(waypoints, idx, x, y, lookahead)
+            target_wp = waypoints[target_idx]
+            gear = target_wp[3]
+            steer = self._pure_pursuit_steer(
+                x=x,
+                y=y,
+                yaw=yaw,
+                target_x=target_wp[0],
+                target_y=target_wp[1],
+                wheelbase=wheelbase,
+                max_steer=max_steer,
+                reverse=(gear == "R"),
+            )
+            front_clearance = self._estimate_forward_clearance(x, y, yaw, reverse=(gear == "R"))
+            target_speed = self._target_speed(final_dist, final_yaw_error, steer, front_clearance)
+            if gear == "R":
+                target_speed = min(target_speed, 0.55)
+            accel, brake = self._speed_command(abs(v), target_speed)
+            delta = self._move_toward(delta, steer, PREVIEW_STEER_RATE * PREVIEW_DT)
+            if gear != prev_gear:
+                gear_switches += 1
+                prev_gear = gear
+            steer_sign = 0
+            if abs(delta) >= math.radians(1.0):
+                steer_sign = 1 if delta > 0 else -1
+            if steer_sign:
+                if prev_steer_sign and steer_sign != prev_steer_sign:
+                    steer_flips += 1
+                prev_steer_sign = steer_sign
+            direction = 1.0 if gear == "D" else -1.0
+            signed_v = direction * abs(v)
+            a = direction * PREVIEW_MAX_ACCEL * accel
+            if brake > 1e-3:
+                a -= math.copysign(PREVIEW_MAX_BRAKE * brake, signed_v if abs(signed_v) > 1e-6 else direction)
+            signed_v += a * PREVIEW_DT
+            if gear == "D":
+                signed_v = max(0.0, signed_v)
+            else:
+                signed_v = min(0.0, signed_v)
+            v = abs(signed_v)
+            x += signed_v * PREVIEW_DT * math.cos(yaw)
+            y += signed_v * PREVIEW_DT * math.sin(yaw)
+            yaw = self._wrap_to_pi(yaw + (signed_v * PREVIEW_DT / max(wheelbase, 1e-6)) * math.tan(delta))
+            move_dist += math.hypot(x - prev_x, y - prev_y)
+            prev_x, prev_y = x, y
+            best_iou_proxy = max(best_iou_proxy, self._slot_center_iou_proxy(target_slot, x, y))
+            if self._pose_collides(x, y, yaw, target_slot):
+                return 10000.0 + 20.0 * (1.0 - best_iou_proxy) + 0.2 * final_dist, "collision", best_iou_proxy
+            if final_dist < self._slot_center_tolerance(list(target_slot)) and final_yaw_error < math.radians(16.0) and abs(v) < 0.25:
+                return 0.02 * t + 0.01 * move_dist + 0.1 * steer_flips + 0.2 * gear_switches, "success", best_iou_proxy
+            t += PREVIEW_DT
+        final_wp = waypoints[-1]
+        final_dist = math.hypot(final_wp[0] - x, final_wp[1] - y)
+        final_yaw_error = abs(self._wrap_to_pi(final_wp[2] - yaw))
+        return 3000.0 + 10.0 * final_dist + 3.0 * final_yaw_error - 100.0 * best_iou_proxy, "timeout", best_iou_proxy
+
+    def _preview_advance_index(
+        self,
+        waypoints: List[Waypoint],
+        current_idx: int,
+        x: float,
+        y: float,
+        yaw: float,
+    ) -> int:
+        idx = min(current_idx, len(waypoints) - 1)
+        run_end = self._preview_same_gear_run_end(waypoints, idx)
+        start = max(0, idx - 2)
+        closest = idx
+        closest_dist = float("inf")
+        for cand_idx in range(start, run_end + 1):
+            wp = waypoints[cand_idx]
+            dist = math.hypot(wp[0] - x, wp[1] - y)
+            if dist < closest_dist:
+                closest = cand_idx
+                closest_dist = dist
+        idx = max(idx, closest)
+        while idx < run_end:
+            current = waypoints[idx]
+            nxt = waypoints[idx + 1]
+            if math.hypot(nxt[0] - x, nxt[1] - y) + 0.2 < math.hypot(current[0] - x, current[1] - y):
+                idx += 1
+            else:
+                break
+        if idx == run_end and idx < len(waypoints) - 1:
+            boundary = waypoints[run_end]
+            dist_ok = math.hypot(boundary[0] - x, boundary[1] - y) <= GEAR_TRANSITION_RADIUS
+            yaw_ok = abs(self._wrap_to_pi(boundary[2] - yaw)) <= GEAR_TRANSITION_YAW_TOLERANCE
+            if dist_ok and yaw_ok:
+                idx += 1
+        return idx
+
+    def _preview_same_gear_run_end(self, waypoints: List[Waypoint], start_idx: int) -> int:
+        idx = min(max(start_idx, 0), len(waypoints) - 1)
+        gear = waypoints[idx][3]
+        while idx < len(waypoints) - 1 and waypoints[idx + 1][3] == gear:
+            idx += 1
+        return idx
+
+    def _preview_lookahead(
+        self,
+        idx: int,
+        hybrid_start_index: int,
+        speed: float,
+        final_dist: float,
+        yaw_error: float,
+    ) -> float:
+        if idx >= hybrid_start_index:
+            return 0.65 if final_dist < 3.0 else 0.95
+        return self._adaptive_lookahead(speed, final_dist, yaw_error)
+
+    def _preview_lookahead_index(
+        self,
+        waypoints: List[Waypoint],
+        idx: int,
+        x: float,
+        y: float,
+        lookahead: float,
+    ) -> int:
+        idx = min(idx, len(waypoints) - 1)
+        accum = math.hypot(waypoints[idx][0] - x, waypoints[idx][1] - y)
+        while idx < len(waypoints) - 1 and accum < lookahead:
+            a = waypoints[idx]
+            b = waypoints[idx + 1]
+            if a[3] != b[3]:
+                return idx
+            accum += math.hypot(b[0] - a[0], b[1] - a[1])
+            idx += 1
+        return idx
+
+    def _slot_center_iou_proxy(
+        self,
+        slot: Tuple[float, float, float, float],
+        x: float,
+        y: float,
+    ) -> float:
+        cx = 0.5 * (slot[0] + slot[1])
+        cy = 0.5 * (slot[2] + slot[3])
+        scale = max(abs(slot[1] - slot[0]), abs(slot[3] - slot[2]), 1.0)
+        return max(0.0, 1.0 - math.hypot(x - cx, y - cy) / scale)
+
+    def _pose_collides(
+        self,
+        x: float,
+        y: float,
+        yaw: float,
+        target_slot: Tuple[float, float, float, float],
+    ) -> bool:
+        if self.map_extent is not None:
+            xmin, xmax, ymin, ymax = self.map_extent
+            if not (xmin <= x <= xmax and ymin <= y <= ymax):
+                return True
+        car_poly = self._car_polygon(x, y, yaw)
+        if self._rect_contains_poly(target_slot, car_poly):
+            return False
+        rects = self._obstacle_rects() + self._line_obstacle_rects(half_width=0.25)
+        for rect in rects:
+            if self._poly_intersects_rect(car_poly, rect):
+                return True
+        return False
+
+    def _car_polygon(self, x: float, y: float, yaw: float) -> List[Tuple[float, float]]:
+        half_l = 0.5 * VEHICLE_LONGEST_LENGTH
+        half_w = 0.85
+        corners = [(half_l, half_w), (half_l, -half_w), (-half_l, -half_w), (-half_l, half_w)]
+        c = math.cos(yaw)
+        s = math.sin(yaw)
+        return [(x + c * px - s * py, y + s * px + c * py) for px, py in corners]
+
+    def _rect_contains_poly(
+        self,
+        rect: Tuple[float, float, float, float],
+        poly: List[Tuple[float, float]],
+    ) -> bool:
+        x0, x1, y0, y1 = rect
+        return all(x0 <= px <= x1 and y0 <= py <= y1 for px, py in poly)
+
+    def _poly_intersects_rect(
+        self,
+        poly: List[Tuple[float, float]],
+        rect: Tuple[float, float, float, float],
+    ) -> bool:
+        rx0, rx1, ry0, ry1 = rect
+        rect_poly = [(rx0, ry0), (rx1, ry0), (rx1, ry1), (rx0, ry1)]
+        return self._polys_intersect(poly, rect_poly)
+
+    def _polys_intersect(
+        self,
+        poly_a: List[Tuple[float, float]],
+        poly_b: List[Tuple[float, float]],
+    ) -> bool:
+        for poly in (poly_a, poly_b):
+            for idx in range(len(poly)):
+                x1, y1 = poly[idx]
+                x2, y2 = poly[(idx + 1) % len(poly)]
+                axis = (-(y2 - y1), x2 - x1)
+                length = math.hypot(axis[0], axis[1])
+                if length <= 1e-9:
+                    continue
+                axis = (axis[0] / length, axis[1] / length)
+                min_a, max_a = self._project_polygon(poly_a, axis)
+                min_b, max_b = self._project_polygon(poly_b, axis)
+                if max_a < min_b or max_b < min_a:
+                    return False
+        return True
+
+    def _project_polygon(
+        self,
+        poly: List[Tuple[float, float]],
+        axis: Tuple[float, float],
+    ) -> Tuple[float, float]:
+        dots = [px * axis[0] + py * axis[1] for px, py in poly]
+        return min(dots), max(dots)
+
+    def _move_toward(self, current: float, target: float, step: float) -> float:
+        if current < target:
+            return min(target, current + step)
+        return max(target, current - step)
+
+    def _astar_path(
+        self,
+        start_xy: Tuple[float, float],
+        goal_xy: Tuple[float, float],
+        start_yaw: Optional[float] = None,
+        goal_yaw: Optional[float] = None,
+    ) -> List[Tuple[float, float]]:
+        if self.map_extent is None:
+            return []
+        xmin, xmax, ymin, ymax = self.map_extent
+        grid_step = max(self.cell_size, 0.75)
+        cols = max(1, int(math.ceil((xmax - xmin) / grid_step)))
+        rows = max(1, int(math.ceil((ymax - ymin) / grid_step)))
+        blocked = self._cached_blocked_grid(rows, cols, grid_step)
+        line_penalties = self._cached_line_penalty_grid(rows, cols, grid_step)
+
+        def to_cell(point: Tuple[float, float]) -> Tuple[int, int]:
+            px, py = point
+            col = int((px - xmin) / grid_step)
+            row = int((ymax - py) / grid_step)
+            return max(0, min(rows - 1, row)), max(0, min(cols - 1, col))
+
+        def to_world(cell: Tuple[int, int]) -> Tuple[float, float]:
+            row, col = cell
+            return xmin + (col + 0.5) * grid_step, ymax - (row + 0.5) * grid_step
+
+        start = to_cell(start_xy)
+        goal = to_cell(goal_xy)
+        self._clear_cell(blocked, start, radius=3)
+        self._clear_cell(blocked, goal, radius=4)
+
+        heading_moves = [
+            (0, 1, 0.0),       # east
+            (-1, 1, math.pi / 4.0),
+            (-1, 0, math.pi / 2.0),
+            (-1, -1, 3.0 * math.pi / 4.0),
+            (0, -1, math.pi),
+            (1, -1, -3.0 * math.pi / 4.0),
+            (1, 0, -math.pi / 2.0),
+            (1, 1, -math.pi / 4.0),
+        ]
+        start_heading = self._heading_index(start_yaw if start_yaw is not None else 0.0)
+        goal_heading = self._heading_index(goal_yaw) if goal_yaw is not None else None
+        start_state = (start[0], start[1], start_heading)
+
+        open_heap: List[Tuple[float, float, Tuple[int, int, int]]] = []
+        heapq.heappush(open_heap, (0.0, 0.0, start_state))
+        came_from: Dict[Tuple[int, int, int], Tuple[int, int, int]] = {}
+        cost_so_far: Dict[Tuple[int, int, int], float] = {start_state: 0.0}
+        goal_state: Optional[Tuple[int, int, int]] = None
+        expansions = 0
+        max_expansions = max(2500, rows * cols * 4)
+
+        while open_heap:
+            _, _, current = heapq.heappop(open_heap)
+            expansions += 1
+            if (current[0], current[1]) == goal and self._goal_heading_ok(current[2], goal_heading):
+                goal_state = current
+                break
+            if expansions > max_expansions:
+                break
+            for turn in (-1, 0, 1):
+                next_heading = (current[2] + turn) % len(heading_moves)
+                dr, dc, _ = heading_moves[next_heading]
+                nxt = (current[0] + dr, current[1] + dc, next_heading)
+                if not (0 <= nxt[0] < rows and 0 <= nxt[1] < cols):
+                    continue
+                if blocked[nxt[0]][nxt[1]]:
+                    continue
+                move_cost = math.hypot(dr, dc)
+                turn_penalty = 0.55 * abs(turn)
+                heading_penalty = 0.0
+                if goal_heading is not None:
+                    heading_penalty = 0.05 * self._heading_index_distance(next_heading, goal_heading)
+                clearance_penalty = line_penalties[nxt[0]][nxt[1]]
+                new_cost = (
+                    cost_so_far[current]
+                    + move_cost
+                    + turn_penalty
+                    + heading_penalty
+                    + clearance_penalty
+                )
+                if new_cost >= cost_so_far.get(nxt, float("inf")):
+                    continue
+                cost_so_far[nxt] = new_cost
+                heuristic = math.hypot(goal[0] - nxt[0], goal[1] - nxt[1])
+                heapq.heappush(open_heap, (new_cost + heuristic, new_cost, nxt))
+                came_from[nxt] = current
+
+        if goal_state is None:
+            return []
+
+        states = [goal_state]
+        while states[-1] != start_state:
+            states.append(came_from[states[-1]])
+        states.reverse()
+        path = [start_xy]
+        path.extend(to_world((state[0], state[1])) for state in states[1:-1])
+        path.append(goal_xy)
+        return path
+
+    def _heading_index(self, yaw: float) -> int:
+        return int(round(self._wrap_to_pi(yaw) / (math.pi / 4.0))) % 8
+
+    def _heading_index_distance(self, a: int, b: int) -> int:
+        diff = abs(a - b) % 8
+        return min(diff, 8 - diff)
+
+    def _goal_heading_ok(self, heading: int, goal_heading: Optional[int]) -> bool:
+        if goal_heading is None:
+            return True
+        return self._heading_index_distance(heading, goal_heading) <= 1
+
+    def _warm_planning_caches(self) -> None:
+        if self.map_extent is None:
+            return
+        xmin, xmax, ymin, ymax = self.map_extent
+        grid_step = max(self.cell_size, 0.75)
+        cols = max(1, int(math.ceil((xmax - xmin) / grid_step)))
+        rows = max(1, int(math.ceil((ymax - ymin) / grid_step)))
+        self._cached_blocked_grid(rows, cols, grid_step)
+        self._cached_line_penalty_grid(rows, cols, grid_step)
+
+    def _cached_blocked_grid(self, rows: int, cols: int, grid_step: float) -> List[List[bool]]:
+        if (
+            self.blocked_grid_cache is None
+            or self.blocked_grid_cache[0] != rows
+            or self.blocked_grid_cache[1] != cols
+            or abs(self.blocked_grid_cache[2] - grid_step) > 1e-9
+        ):
+            base = self._build_blocked_grid(rows, cols, grid_step)
+            self.blocked_grid_cache = (rows, cols, grid_step, base)
+        return [row[:] for row in self.blocked_grid_cache[3]]
+
+    def _cached_line_penalty_grid(self, rows: int, cols: int, grid_step: float) -> List[List[float]]:
+        if (
+            self.line_penalty_grid_cache is None
+            or self.line_penalty_grid_cache[0] != rows
+            or self.line_penalty_grid_cache[1] != cols
+            or abs(self.line_penalty_grid_cache[2] - grid_step) > 1e-9
+        ):
+            penalties = self._build_line_penalty_grid(rows, cols, grid_step)
+            self.line_penalty_grid_cache = (rows, cols, grid_step, penalties)
+        return self.line_penalty_grid_cache[3]
+
+    def _build_line_penalty_grid(self, rows: int, cols: int, grid_step: float) -> List[List[float]]:
+        penalties = [[0.0 for _ in range(cols)] for _ in range(rows)]
+        if self.map_extent is None:
+            return penalties
+        line_rects = self._line_obstacle_rects(half_width=0.08)
+        if not line_rects:
+            return penalties
+        margin = PLANNING_OBSTACLE_MARGIN + LINE_EXTRA_CLEARANCE
+        for rect in line_rects:
+            self._mark_penalty_rect(penalties, rect, grid_step, margin=margin, penalty=2.0)
+        return penalties
+
+    def _mark_penalty_rect(
+        self,
+        penalties: List[List[float]],
+        rect: Tuple[float, float, float, float],
+        grid_step: float,
+        margin: float,
+        penalty: float,
+    ) -> None:
+        if self.map_extent is None:
+            return
+        xmin, _, _, ymax = self.map_extent
+        rows = len(penalties)
+        cols = len(penalties[0]) if rows else 0
+        rx0, rx1, ry0, ry1 = rect
+        rx0 -= margin
+        rx1 += margin
+        ry0 -= margin
+        ry1 += margin
+        c0 = max(0, int((rx0 - xmin) / grid_step))
+        c1 = min(cols - 1, int((rx1 - xmin) / grid_step))
+        r0 = max(0, int((ymax - ry1) / grid_step))
+        r1 = min(rows - 1, int((ymax - ry0) / grid_step))
+        for row in range(r0, r1 + 1):
+            for col in range(c0, c1 + 1):
+                penalties[row][col] = max(penalties[row][col], penalty)
+
+    def _build_blocked_grid(self, rows: int, cols: int, grid_step: float) -> List[List[bool]]:
+        blocked = [[False for _ in range(cols)] for _ in range(rows)]
+        if self.map_extent is None:
+            return blocked
+        xmin, _, _, ymax = self.map_extent
+
+        for rect in self._obstacle_rects():
+            self._mark_rect(blocked, rect, grid_step, margin=PLANNING_OBSTACLE_MARGIN)
+        for rect in self._line_obstacle_rects(half_width=0.08):
+            self._mark_rect(blocked, rect, grid_step, margin=PLANNING_OBSTACLE_MARGIN)
+        # The stationary grid is useful for later scoring/cost tuning, but as a
+        # hard obstacle it closes many center-line A* corridors in this map.
+        # Keep the baseline explainable: hard-block occupied slots and walls.
+        return self._inflate_blocked(blocked, radius_cells=0)
+
+    def _obstacle_rects(self) -> List[Tuple[float, float, float, float]]:
+        rects: List[Tuple[float, float, float, float]] = []
+        if not self.map_data:
+            return rects
+        slots = self.map_data.get("slots") or []
+        occupied = self.map_data.get("occupied_idx") or []
+        for idx, slot in enumerate(slots):
+            if idx < len(occupied) and bool(occupied[idx]):
+                rects.append(tuple(float(v) for v in slot))
+        for rect in self.map_data.get("walls_rects") or []:
+            rects.append(tuple(float(v) for v in rect))
+        return rects
+
+    def _line_obstacle_rects(self, half_width: float) -> List[Tuple[float, float, float, float]]:
+        rects: List[Tuple[float, float, float, float]] = []
+        if not self.map_data or self.map_extent is None:
+            return rects
+        xmin, xmax, ymin, ymax = self.map_extent
+        for line in self.map_data.get("lines") or []:
+            if len(line) != 4:
+                continue
+            x1, y1, x2, y2 = (float(v) for v in line)
+            if abs(x1 - x2) < 1e-6:
+                rx0 = min(x1, x2) - half_width
+                rx1 = max(x1, x2) + half_width
+                ry0 = min(y1, y2)
+                ry1 = max(y1, y2)
+            elif abs(y1 - y2) < 1e-6:
+                rx0 = min(x1, x2)
+                rx1 = max(x1, x2)
+                ry0 = min(y1, y2) - half_width
+                ry1 = max(y1, y2) + half_width
+            else:
+                rx0 = min(x1, x2) - half_width
+                rx1 = max(x1, x2) + half_width
+                ry0 = min(y1, y2) - half_width
+                ry1 = max(y1, y2) + half_width
+            rx0 = max(rx0, xmin)
+            rx1 = min(rx1, xmax)
+            ry0 = max(ry0, ymin)
+            ry1 = min(ry1, ymax)
+            if rx1 > rx0 and ry1 > ry0:
+                rects.append((rx0, rx1, ry0, ry1))
+        return rects
+
+    def _mark_rect(
+        self,
+        blocked: List[List[bool]],
+        rect: Tuple[float, float, float, float],
+        grid_step: float,
+        margin: float,
+    ) -> None:
+        if self.map_extent is None:
+            return
+        xmin, _, _, ymax = self.map_extent
+        rows = len(blocked)
+        cols = len(blocked[0]) if rows else 0
+        rx0, rx1, ry0, ry1 = rect
+        rx0 -= margin
+        rx1 += margin
+        ry0 -= margin
+        ry1 += margin
+        c0 = max(0, int((rx0 - xmin) / grid_step))
+        c1 = min(cols - 1, int((rx1 - xmin) / grid_step))
+        r0 = max(0, int((ymax - ry1) / grid_step))
+        r1 = min(rows - 1, int((ymax - ry0) / grid_step))
+        for row in range(r0, r1 + 1):
+            for col in range(c0, c1 + 1):
+                blocked[row][col] = True
+
+    def _inflate_blocked(self, blocked: List[List[bool]], radius_cells: int) -> List[List[bool]]:
+        rows = len(blocked)
+        cols = len(blocked[0]) if rows else 0
+        inflated = [row[:] for row in blocked]
+        for row in range(rows):
+            for col in range(cols):
+                if not blocked[row][col]:
+                    continue
+                for dr in range(-radius_cells, radius_cells + 1):
+                    for dc in range(-radius_cells, radius_cells + 1):
+                        rr = row + dr
+                        cc = col + dc
+                        if 0 <= rr < rows and 0 <= cc < cols:
+                            inflated[rr][cc] = True
+        return inflated
+
+    def _clear_cell(self, blocked: List[List[bool]], cell: Tuple[int, int], radius: int) -> None:
+        rows = len(blocked)
+        cols = len(blocked[0]) if rows else 0
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                rr = cell[0] + dr
+                cc = cell[1] + dc
+                if 0 <= rr < rows and 0 <= cc < cols:
+                    blocked[rr][cc] = False
+
+    def _simplify_path(
+        self,
+        path: List[Tuple[float, float]],
+        spacing: float,
+    ) -> List[Tuple[float, float]]:
+        if len(path) <= 2:
+            return path
+        simplified = [path[0]]
+        last = path[0]
+        for point in path[1:-1]:
+            if math.hypot(point[0] - last[0], point[1] - last[1]) >= spacing:
+                simplified.append(point)
+                last = point
+        simplified.append(path[-1])
+        return simplified
+
+    def _points_to_waypoints(
+        self,
+        points: List[Tuple[float, float]],
+        final_yaw: float,
+        gear: str,
+    ) -> List[Waypoint]:
+        waypoints: List[Waypoint] = []
+        for idx, point in enumerate(points):
+            if idx < len(points) - 1:
+                nxt = points[idx + 1]
+                yaw = math.atan2(nxt[1] - point[1], nxt[0] - point[0])
+            else:
+                yaw = final_yaw
+            waypoints.append((point[0], point[1], yaw, gear))
+        return waypoints
+
+    def _advance_waypoint_index(self, x: float, y: float) -> None:
+        if self.waypoint_index >= self.hybrid_start_index:
+            self._advance_terminal_waypoint_index(x, y)
+            return
+        run_end = min(self.hybrid_start_index - 1, len(self.waypoints) - 1)
+        start = max(0, self.waypoint_index - 2)
+        closest = self.waypoint_index
+        closest_dist = float("inf")
+        for idx in range(start, run_end + 1):
+            wp = self.waypoints[idx]
+            dist = math.hypot(wp[0] - x, wp[1] - y)
+            if dist < closest_dist:
+                closest = idx
+                closest_dist = dist
+        self.waypoint_index = max(self.waypoint_index, closest)
+        while self.waypoint_index < len(self.waypoints) - 1:
+            wp = self.waypoints[self.waypoint_index]
+            if math.hypot(wp[0] - x, wp[1] - y) > 0.8:
+                break
+            self.waypoint_index += 1
+
+    def _advance_terminal_waypoint_index(self, x: float, y: float) -> None:
+        if not self.waypoints:
+            return
+        self.waypoint_index = min(self.waypoint_index, len(self.waypoints) - 1)
+        run_end = self._same_gear_run_end(self.waypoint_index)
+        start = max(0, self.waypoint_index - 2)
+        closest = self.waypoint_index
+        closest_dist = float("inf")
+        for idx in range(start, run_end + 1):
+            wp = self.waypoints[idx]
+            dist = math.hypot(wp[0] - x, wp[1] - y)
+            if dist < closest_dist:
+                closest = idx
+                closest_dist = dist
+        self.waypoint_index = max(self.waypoint_index, closest)
+        while self.waypoint_index < run_end:
+            current = self.waypoints[self.waypoint_index]
+            nxt = self.waypoints[self.waypoint_index + 1]
+            if math.hypot(nxt[0] - x, nxt[1] - y) + 0.2 < math.hypot(current[0] - x, current[1] - y):
+                self.waypoint_index += 1
+            else:
+                break
+        if self.waypoint_index == run_end and self.waypoint_index < len(self.waypoints) - 1:
+            boundary = self.waypoints[run_end]
+            dist_ok = math.hypot(boundary[0] - x, boundary[1] - y) <= GEAR_TRANSITION_RADIUS
+            yaw_ok = (
+                abs(self._wrap_to_pi(boundary[2] - self.current_yaw_for_progress))
+                <= GEAR_TRANSITION_YAW_TOLERANCE
+            )
+            if dist_ok and yaw_ok:
+                self.waypoint_index += 1
+
+    def _same_gear_run_end(self, start_idx: int) -> int:
+        idx = min(max(start_idx, 0), len(self.waypoints) - 1)
+        gear = self.waypoints[idx][3]
+        while idx < len(self.waypoints) - 1 and self.waypoints[idx + 1][3] == gear:
+            idx += 1
+        return idx
+
+    def _lookahead_index(self, x: float, y: float, lookahead: float) -> int:
+        idx = self.waypoint_index
+        while idx < len(self.waypoints) - 1:
+            wp = self.waypoints[idx]
+            if math.hypot(wp[0] - x, wp[1] - y) >= lookahead:
+                return idx
+            idx += 1
+        return len(self.waypoints) - 1
+
+    def _adaptive_lookahead(self, speed: float, final_dist: float, yaw_error: float) -> float:
+        if self.waypoint_index >= self.hybrid_start_index:
+            if final_dist < 3.0:
+                return 0.65
+            return 0.95
+        lookahead = 1.65 + 0.45 * min(speed, 3.0)
+        if final_dist > 12.0 and yaw_error < math.radians(25.0):
+            lookahead = max(lookahead, 2.15)
+        if final_dist < 6.0:
+            lookahead = min(lookahead, 1.05)
+        if final_dist < 2.5:
+            lookahead = min(lookahead, 0.70)
+        if yaw_error > math.radians(35.0):
+            lookahead = min(lookahead, 0.90)
+        return max(0.65, lookahead)
+
+    def _pure_pursuit_steer(
+        self,
+        x: float,
+        y: float,
+        yaw: float,
+        target_x: float,
+        target_y: float,
+        wheelbase: float,
+        max_steer: float,
+        reverse: bool,
+    ) -> float:
+        dx = target_x - x
+        dy = target_y - y
+        tracking_yaw = self._wrap_to_pi(yaw + math.pi) if reverse else yaw
+        local_x = math.cos(tracking_yaw) * dx + math.sin(tracking_yaw) * dy
+        local_y = -math.sin(tracking_yaw) * dx + math.cos(tracking_yaw) * dy
+        lookahead = max(0.9, math.hypot(local_x, local_y))
+        alpha = math.atan2(local_y, local_x)
+        steer = math.atan2(2.0 * wheelbase * math.sin(alpha), lookahead)
+        if reverse:
+            steer = -steer
+        return max(-max_steer, min(max_steer, steer))
+
+    def _parking_reverse_target(
+        self,
+        target_center: Tuple[float, float],
+        target_yaw: float,
+    ) -> Waypoint:
+        backout_distance = 3.4
+        tx = target_center[0] - math.cos(target_yaw) * backout_distance
+        ty = target_center[1] - math.sin(target_yaw) * backout_distance
+        tx, ty = self._clamp_inside_map(tx, ty, margin=0.2)
+        return tx, ty, target_yaw, "R"
+
+    def _target_speed(
+        self,
+        final_dist: float,
+        yaw_error: float,
+        steer: float,
+        front_clearance: float,
+    ) -> float:
+        in_parking_mode = final_dist < PARKING_ALIGN_DISTANCE
+        target = min(4.20, 1.80 + 0.07 * final_dist)
+        if (
+            front_clearance >= FRONT_CLEAR_DISTANCE
+            and final_dist > 4.0
+            and yaw_error < math.radians(25.0)
+            and abs(steer) < math.radians(22.0)
+        ):
+            target += FRONT_CLEAR_SPEED_BONUS + 0.35
+        if final_dist < 6.0:
+            target = 1.15
+        if in_parking_mode:
+            target = min(target, 0.65)
+        if final_dist < 2.2:
+            target = 0.28
+        if final_dist < 1.0:
+            target = 0.12
+        if yaw_error > math.radians(35.0) or abs(steer) > math.radians(25.0):
+            turn_cap = 2.40 if not in_parking_mode else 0.45
+            target = min(target, turn_cap)
+        if front_clearance < OBSTACLE_SLOW_DISTANCE:
+            target = min(target, 0.60 if not in_parking_mode else 0.45)
+        if front_clearance < OBSTACLE_STOP_DISTANCE:
+            target = 0.0
+        return target
+
+    def _inside_map(self, x: float, y: float, margin: float = 0.4) -> bool:
+        if self.map_extent is None:
+            return True
+        xmin, xmax, ymin, ymax = self.map_extent
+        margin = max(margin, VEHICLE_CENTER_CLEARANCE + EXTRA_SAFETY_MARGIN)
+        return xmin + margin <= x <= xmax - margin and ymin + margin <= y <= ymax - margin
+
+    def _clamp_inside_map(self, x: float, y: float, margin: float = 0.4) -> Tuple[float, float]:
+        if self.map_extent is None:
+            return x, y
+        xmin, xmax, ymin, ymax = self.map_extent
+        margin = max(margin, VEHICLE_CENTER_CLEARANCE + EXTRA_SAFETY_MARGIN)
+        return (
+            max(xmin + margin, min(xmax - margin, x)),
+            max(ymin + margin, min(ymax - margin, y)),
+        )
+
+    def _path_length(self, path: List[Tuple[float, float]]) -> float:
+        if len(path) < 2:
+            return 0.0
+        return sum(
+            math.hypot(path[i][0] - path[i - 1][0], path[i][1] - path[i - 1][1])
+            for i in range(1, len(path))
+        )
+
+    def _line_margin_penalty(self, point: Tuple[float, float]) -> float:
+        clearance = self._estimate_clearance(point, include_lines=True)
+        if clearance >= LINE_EXTRA_CLEARANCE:
+            return 0.0
+        shortage = LINE_EXTRA_CLEARANCE - clearance
+        return 4.0 * shortage / max(LINE_EXTRA_CLEARANCE, 1e-6)
+
+    def _speed_command(
+        self,
+        speed: float,
+        target_speed: float,
+        front_is_clear: bool = False,
+        force_full_accel: bool = False,
+    ) -> Tuple[float, float]:
+        error = target_speed - speed
+        if target_speed <= 0.05:
+            return 0.0, 1.0
+        if force_full_accel and error > 0.05:
+            return 1.0, 0.0
+        if error > 0.15:
+            accel_cap = 1.0 if front_is_clear else 0.9
+            accel_base = 0.70 if front_is_clear else 0.55
+            accel_gain = 0.70 if front_is_clear else 0.55
+            return min(accel_cap, accel_base + accel_gain * error), 0.0
+        if error < -0.08:
+            return 0.0, min(0.8, 0.25 + 0.35 * (-error))
+        return 0.0, 0.0
+
+    def _estimate_forward_clearance(
+        self,
+        x: float,
+        y: float,
+        yaw: float,
+        reverse: bool = False,
+        max_distance: float = FRONT_CLEAR_DISTANCE,
+    ) -> float:
+        heading = self._wrap_to_pi(yaw + math.pi) if reverse else yaw
+        step = 0.5
+        distance = step
+        while distance <= max_distance:
+            px = x + math.cos(heading) * distance
+            py = y + math.sin(heading) * distance
+            if self._estimate_clearance(
+                (px, py),
+                include_lines=True,
+            ) <= 0.05:
+                return distance
+            distance += step
+        return max_distance
+
+    def _estimate_min_obstacle_distance(self, point: Tuple[float, float]) -> float:
+        return self._estimate_clearance(point, include_lines=False)
+
+    def _estimate_clearance(
+        self,
+        point: Tuple[float, float],
+        include_lines: bool = False,
+    ) -> float:
+        px, py = point
+        best = float("inf")
+        if self.map_extent is not None:
+            xmin, xmax, ymin, ymax = self.map_extent
+            best = min(best, px - xmin, xmax - px, py - ymin, ymax - py)
+        rects = self._obstacle_rects()
+        if include_lines:
+            rects = rects + self._line_obstacle_rects(half_width=0.08)
+        for rx0, rx1, ry0, ry1 in rects:
+            dx = max(rx0 - px, 0.0, px - rx1)
+            dy = max(ry0 - py, 0.0, py - ry1)
+            best = min(best, math.hypot(dx, dy))
+        return max(0.0, best - VEHICLE_CENTER_CLEARANCE - EXTRA_SAFETY_MARGIN)
+
+    def _log_evaluation(
+        self,
+        parking_success: bool,
+        fail_reason: str,
+        final_position_error: float,
+        final_yaw_error: float,
+        collision: bool,
+        current_time: Optional[float] = None,
+        force: bool = False,
+    ) -> None:
+        if parking_success and self.final_eval_logged:
+            return
+        if not force and current_time is not None and current_time - self.last_eval_log_time < 5.0:
+            return
+        if parking_success:
+            self.final_eval_logged = True
+        if current_time is not None:
+            self.last_eval_log_time = current_time
+        payload = {
+            "parking_success": bool(parking_success),
+            "fail_reason": fail_reason,
+            "final_position_error": round(float(final_position_error), 3),
+            "final_yaw_error": round(math.degrees(float(final_yaw_error)), 2),
+            "min_obstacle_distance": (
+                None
+                if math.isinf(self.min_obstacle_distance)
+                else round(float(self.min_obstacle_distance), 3)
+            ),
+            "collision": bool(collision),
+            "step_count": int(self.step_count),
+            "rl_speed_control": "ON" if self.rl_speed and self.rl_speed.enabled else "OFF",
+        }
+        print("[eval] " + json.dumps(payload, sort_keys=True))
+
+    @staticmethod
+    def _wrap_to_pi(angle: float) -> float:
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
+
+
+planner = PlannerSkeleton()
+
+
+def handle_map_payload(map_payload: Dict[str, Any]) -> None:
+    """Called by ipc_client.py when the simulator sends the static map."""
+
+    planner.set_map(map_payload)
+
+
+def planner_step(obs: Dict[str, Any]) -> Dict[str, Any]:
+    """Called by ipc_client.py every simulation tick."""
+
+    try:
+        return planner.compute_control(obs)
+    except Exception as exc:
+        print(f"[algo] planner_step error: {exc}")
+        return {"steer": 0.0, "accel": 0.0, "brake": 0.8, "gear": "D"}
