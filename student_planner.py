@@ -68,6 +68,10 @@ TERMINAL_PRIMITIVE_STEPS = 6
 TERMINAL_MAX_ITERATIONS = 3600
 GEAR_TRANSITION_RADIUS = 1.25
 GEAR_TRANSITION_YAW_TOLERANCE = math.radians(45.0)
+TERMINAL_LOOP_STUCK_TICKS = 240
+TERMINAL_LOOP_FORCE_RADIUS = 1.10
+TERMINAL_REPLAN_STUCK_TICKS = 360
+TERMINAL_REPLAN_MAX_COUNT = 0
 SEMANTIC_ENTRY_BONUS = 3.0
 FALLBACK_ENTRY_PENALTY = 4.0
 PREVIEW_MAX_TIME = 22.0
@@ -75,6 +79,8 @@ PREVIEW_DT = 0.10
 PREVIEW_MAX_ACCEL = 2.8
 PREVIEW_MAX_BRAKE = 4.5
 PREVIEW_STEER_RATE = math.radians(240.0)
+SPATIAL_INDEX_CELL_SIZE = 4.0
+CLEARANCE_QUERY_RADIUS = 8.0
 
 
 def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
@@ -128,6 +134,15 @@ class PlannerSkeleton:
     obstacle_rect_cache: Optional[List[Tuple[float, float, float, float]]] = None
     line_rect_cache: Optional[Dict[float, List[Tuple[float, float, float, float]]]] = None
     collision_rect_cache: Optional[List[Tuple[float, float, float, float]]] = None
+    spatial_index_cache: Optional[
+        Dict[
+            str,
+            Tuple[
+                float,
+                Dict[Tuple[int, int], List[Tuple[float, float, float, float]]],
+            ],
+        ]
+    ] = None
     parking_reverse_ticks: int = 0
     parking_reverse_cooldown: int = 0
     parking_has_reversed: bool = False
@@ -137,6 +152,10 @@ class PlannerSkeleton:
     planning_signature: Optional[Tuple[float, ...]] = None
     planning_started_at: float = -999.0
     last_command_gear: str = "D"
+    terminal_progress_index: int = -1
+    terminal_progress_best_dist: float = float("inf")
+    terminal_stuck_ticks: int = 0
+    terminal_replan_count: int = 0
 
     def __post_init__(self) -> None:
         if self.waypoints is None:
@@ -169,6 +188,7 @@ class PlannerSkeleton:
         self.obstacle_rect_cache = None
         self.line_rect_cache = None
         self.collision_rect_cache = None
+        self.spatial_index_cache = None
         self.parking_reverse_ticks = 0
         self.parking_reverse_cooldown = 0
         self.parking_has_reversed = False
@@ -178,6 +198,10 @@ class PlannerSkeleton:
         self.planning_signature = None
         self.planning_started_at = -999.0
         self.last_command_gear = "D"
+        self.terminal_progress_index = -1
+        self.terminal_progress_best_dist = float("inf")
+        self.terminal_stuck_ticks = 0
+        self.terminal_replan_count = 0
         self.rl_speed = RLSpeedController(enabled=USE_RL_SPEED_CONTROL)
         self._warm_planning_caches()
         print(f"[algo] rl_speed_control={'ON' if USE_RL_SPEED_CONTROL else 'OFF'}")
@@ -192,6 +216,9 @@ class PlannerSkeleton:
         self.parking_has_reversed = False
         self.hybrid_start_index = 10**9
         self.last_command_gear = "D"
+        self.terminal_progress_index = -1
+        self.terminal_progress_best_dist = float("inf")
+        self.terminal_stuck_ticks = 0
         state = obs.get("state", {})
         start = (
             float(state.get("x", 0.0)),
@@ -537,6 +564,25 @@ class PlannerSkeleton:
 
         self.current_yaw_for_progress = yaw
         self._advance_waypoint_index(x, y)
+        if (
+            self.waypoint_index >= self.hybrid_start_index
+            and self.terminal_stuck_ticks >= TERMINAL_REPLAN_STUCK_TICKS
+            and final_dist > 0.8
+        ):
+            if speed > 0.12:
+                return {"steer": 0.0, "accel": 0.0, "brake": 1.0, "gear": self.last_command_gear}
+            if self.terminal_replan_count >= TERMINAL_REPLAN_MAX_COUNT:
+                self.planning_fail_reason = "terminal_loop_hold"
+                return {"steer": 0.0, "accel": 0.0, "brake": 1.0, "gear": self.last_command_gear}
+            self.terminal_replan_count += 1
+            print(
+                "[algo] terminal recovery: replanning from current pose"
+                f" count={self.terminal_replan_count}"
+                f" wp={self.waypoint_index}/{len(self.waypoints) - 1}"
+                f" pos_error={final_dist:.2f}m"
+            )
+            self.compute_path(obs)
+            return {"steer": 0.0, "accel": 0.0, "brake": 1.0, "gear": self.last_command_gear}
         lookahead = self._guided_lookahead(speed, final_dist, final_yaw_error)
         target_idx = self._guided_lookahead_index(x, y, lookahead)
         target_wp = self.waypoints[target_idx]
@@ -1129,8 +1175,15 @@ class PlannerSkeleton:
         return self._inflate_blocked(blocked, radius_cells=0)
 
     def _guided_clearance(self, point: Tuple[float, float]) -> float:
-        best = float("inf")
-        for rect in self._obstacle_rects() + self._line_obstacle_rects(half_width=0.25):
+        px, py = point
+        best = CLEARANCE_QUERY_RADIUS
+        for rect in self._nearby_rects(
+            "guided_clearance",
+            self._collision_rects(),
+            px,
+            py,
+            CLEARANCE_QUERY_RADIUS,
+        ):
             best = min(best, self._rect_distance(point, rect))
         return best
 
@@ -1706,7 +1759,13 @@ class PlannerSkeleton:
             return False
         reject_radius = math.hypot(0.5 * VEHICLE_LONGEST_LENGTH, 0.85) + 0.10
         reject_radius_sq = reject_radius * reject_radius
-        for rect in self._collision_rects():
+        for rect in self._nearby_rects(
+            "collision",
+            self._collision_rects(),
+            x,
+            y,
+            reject_radius,
+        ):
             rx0, rx1, ry0, ry1 = rect
             dx = max(rx0 - x, 0.0, x - rx1)
             dy = max(ry0 - y, 0.0, y - ry1)
@@ -1978,6 +2037,63 @@ class PlannerSkeleton:
             self.collision_rect_cache = self._obstacle_rects() + self._line_obstacle_rects(half_width=0.25)
         return self.collision_rect_cache
 
+    def _nearby_rects(
+        self,
+        cache_key: str,
+        rects: List[Tuple[float, float, float, float]],
+        x: float,
+        y: float,
+        radius: float,
+    ) -> List[Tuple[float, float, float, float]]:
+        if not rects or self.map_extent is None:
+            return rects
+        cell_size, buckets = self._spatial_index(cache_key, rects)
+        xmin, _xmax, _ymin, ymax = self.map_extent
+        c0 = int((x - radius - xmin) / cell_size)
+        c1 = int((x + radius - xmin) / cell_size)
+        r0 = int((ymax - (y + radius)) / cell_size)
+        r1 = int((ymax - (y - radius)) / cell_size)
+        nearby: List[Tuple[float, float, float, float]] = []
+        seen = set()
+        for row in range(r0, r1 + 1):
+            for col in range(c0, c1 + 1):
+                for rect in buckets.get((row, col), []):
+                    if rect in seen:
+                        continue
+                    seen.add(rect)
+                    nearby.append(rect)
+        return nearby
+
+    def _spatial_index(
+        self,
+        cache_key: str,
+        rects: List[Tuple[float, float, float, float]],
+    ) -> Tuple[float, Dict[Tuple[int, int], List[Tuple[float, float, float, float]]]]:
+        if self.spatial_index_cache is None:
+            self.spatial_index_cache = {}
+        cached = self.spatial_index_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        cell_size = SPATIAL_INDEX_CELL_SIZE
+        buckets: Dict[Tuple[int, int], List[Tuple[float, float, float, float]]] = {}
+        if self.map_extent is None:
+            result = (cell_size, buckets)
+            self.spatial_index_cache[cache_key] = result
+            return result
+        xmin, _xmax, _ymin, ymax = self.map_extent
+        for rect in rects:
+            rx0, rx1, ry0, ry1 = rect
+            c0 = int((rx0 - xmin) / cell_size)
+            c1 = int((rx1 - xmin) / cell_size)
+            r0 = int((ymax - ry1) / cell_size)
+            r1 = int((ymax - ry0) / cell_size)
+            for row in range(r0, r1 + 1):
+                for col in range(c0, c1 + 1):
+                    buckets.setdefault((row, col), []).append(rect)
+        result = (cell_size, buckets)
+        self.spatial_index_cache[cache_key] = result
+        return result
+
     def _obstacle_rects(self) -> List[Tuple[float, float, float, float]]:
         if self.obstacle_rect_cache is not None:
             return self.obstacle_rect_cache
@@ -2153,11 +2269,25 @@ class PlannerSkeleton:
                 closest = idx
                 closest_dist = dist
         self.waypoint_index = max(self.waypoint_index, closest)
+        active_wp = self.waypoints[self.waypoint_index]
+        active_dist = math.hypot(active_wp[0] - x, active_wp[1] - y)
+        if self.waypoint_index != self.terminal_progress_index:
+            self.terminal_progress_index = self.waypoint_index
+            self.terminal_progress_best_dist = active_dist
+            self.terminal_stuck_ticks = 0
+        elif active_dist < self.terminal_progress_best_dist - 0.08:
+            self.terminal_progress_best_dist = active_dist
+            self.terminal_stuck_ticks = 0
+        else:
+            self.terminal_stuck_ticks += 1
         while self.waypoint_index < run_end:
             current = self.waypoints[self.waypoint_index]
             nxt = self.waypoints[self.waypoint_index + 1]
             if math.hypot(nxt[0] - x, nxt[1] - y) + 0.2 < math.hypot(current[0] - x, current[1] - y):
                 self.waypoint_index += 1
+                self.terminal_progress_index = self.waypoint_index
+                self.terminal_progress_best_dist = math.hypot(nxt[0] - x, nxt[1] - y)
+                self.terminal_stuck_ticks = 0
             else:
                 break
         if self.waypoint_index == run_end and self.waypoint_index < len(self.waypoints) - 1:
@@ -2167,8 +2297,29 @@ class PlannerSkeleton:
                 abs(self._wrap_to_pi(boundary[2] - self.current_yaw_for_progress))
                 <= GEAR_TRANSITION_YAW_TOLERANCE
             )
+            boundary_dist = math.hypot(boundary[0] - x, boundary[1] - y)
+            next_gear = self.waypoints[run_end + 1][3]
+            stuck_at_gear_boundary = (
+                self.terminal_stuck_ticks >= TERMINAL_LOOP_STUCK_TICKS
+                and next_gear != boundary[3]
+                and boundary_dist <= TERMINAL_LOOP_FORCE_RADIUS
+            )
             if dist_ok and yaw_ok:
                 self.waypoint_index += 1
+                self.terminal_progress_index = self.waypoint_index
+                self.terminal_progress_best_dist = float("inf")
+                self.terminal_stuck_ticks = 0
+            elif stuck_at_gear_boundary:
+                print(
+                    "[algo] terminal recovery: forced gear-boundary advance"
+                    f" wp={run_end}->{run_end + 1}"
+                    f" boundary_dist={boundary_dist:.2f}m"
+                    f" yaw_error={math.degrees(abs(self._wrap_to_pi(boundary[2] - self.current_yaw_for_progress))):.1f}deg"
+                )
+                self.waypoint_index += 1
+                self.terminal_progress_index = self.waypoint_index
+                self.terminal_progress_best_dist = float("inf")
+                self.terminal_stuck_ticks = 0
 
     def _same_gear_run_end(self, start_idx: int) -> int:
         idx = min(max(start_idx, 0), len(self.waypoints) - 1)
@@ -2358,9 +2509,12 @@ class PlannerSkeleton:
             xmin, xmax, ymin, ymax = self.map_extent
             best = min(best, px - xmin, xmax - px, py - ymin, ymax - py)
         rects = self._obstacle_rects()
+        cache_key = "clearance_obstacles"
         if include_lines:
             rects = rects + self._line_obstacle_rects(half_width=0.08)
-        for rx0, rx1, ry0, ry1 in rects:
+            cache_key = "clearance_with_lines"
+        search_radius = CLEARANCE_QUERY_RADIUS + VEHICLE_CENTER_CLEARANCE + EXTRA_SAFETY_MARGIN
+        for rx0, rx1, ry0, ry1 in self._nearby_rects(cache_key, rects, px, py, search_radius):
             dx = max(rx0 - px, 0.0, px - rx1)
             dy = max(ry0 - py, 0.0, py - ry1)
             best = min(best, math.hypot(dx, dy))

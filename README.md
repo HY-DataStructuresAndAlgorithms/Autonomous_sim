@@ -16,7 +16,7 @@ The planner keeps the existing A* style structure but shapes the search for park
 - Use a local terminal Hybrid A* over `(x, y, yaw, gear)` to produce curved waypoints.
 - Add a start stabilizer waypoint so the vehicle does not immediately cut into the first parking-line edge.
 - Use asynchronous planning in Pygame mode to avoid IPC timeout.
-- Cache planning geometry and use a distance prefilter before polygon collision checks to reduce waypoint search time.
+- Cache planning geometry, use a spatial index, and apply a distance prefilter before polygon collision checks to reduce waypoint search time.
 
 Core cost form:
 
@@ -69,10 +69,11 @@ So the final selected path is not just the shortest path. It is the path that is
 
 ```text
 cache: occupied slots / wall rects / line rects / guided A* blocked grid
+spatial index: query only nearby obstacle/line rectangles around the vehicle pose
 prefilter: skip polygon intersection if rect is farther than the vehicle bounding radius
 ```
 
-This reduces the slow terminal Hybrid A* collision-check loop without changing the simulator collision rules.
+This reduces the slow terminal Hybrid A* collision-check loop without changing the simulator collision rules. On the hard target-6 case, first planning time dropped from about `22.6s` before optimization to about `0.86s` in synchronous local profiling.
 
 ## Implementation Sketch
 
@@ -101,6 +102,6 @@ default_lot map_seed=821958799 target_idx=6  success, score=79.23, IoU=0.3002, c
 default_lot seed=202                         success, score=74.94, IoU=0.3001, collision=-
 ```
 
-Pygame IPC check: first command returned in about `0.014s`; background planning for the hard target-6 case finished in about `2.1s`.
+Pygame IPC check: first command returned in about `0.007s`; background planning for the hard target-6 case finished in about `0.81s`.
 
-Known limitation: `training_course seed=707` still times out without collision in the current planner-only version. More tuning is needed for rear-in / dense-lot cases.
+Known limitation: `training_course seed=707` still times out without collision in the current planner-only version. A terminal loop guard now brakes and holds instead of letting the vehicle keep circling (`terminal_loop_hold`), but rear-in / dense-lot success still needs a better terminal planner or controller.
