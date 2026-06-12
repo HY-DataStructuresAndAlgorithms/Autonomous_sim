@@ -55,8 +55,12 @@ PARKING_TARGET_OVERSHOOT = 0.30
 LINE_EXTRA_CLEARANCE = 0.20
 LINE_COLLISION_HALF_WIDTH = 0.25
 LINE_HARD_MARGIN = 0.05
-A_STAR_GRID_STEP = 2.00
+A_STAR_GRID_STEP = 1.00
 A_STAR_MAX_HEADING_STEP = 1  # 8-heading grid: one step means at most 45 degrees.
+A_STAR_USE_POSE_GRID = False
+START_ALIGNMENT_DISTANCE = 2.2
+START_ALIGNMENT_MIN_SPEED = 0.35
+START_STEER_LIMIT = math.radians(14.0)
 
 
 def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
@@ -187,6 +191,7 @@ class PlannerSkeleton:
             )
 
         simplified = self._simplify_path(grid_path, spacing=1.0)
+        simplified = self._prepend_start_alignment(simplified, start)
         points = simplified
         self.waypoints = self._points_to_waypoints(
             points,
@@ -395,6 +400,12 @@ class PlannerSkeleton:
         )
         if reverse_realigning:
             steer = 0.0
+        if (
+            not in_parking_mode
+            and gear == "D"
+            and speed < START_ALIGNMENT_MIN_SPEED
+        ):
+            steer = max(-START_STEER_LIMIT, min(START_STEER_LIMIT, steer))
 
         front_clearance = self._estimate_forward_clearance(
             x=x,
@@ -425,6 +436,13 @@ class PlannerSkeleton:
         )
         if gear == "R":
             rule_speed = min(rule_speed, 0.55)
+        if (
+            not in_parking_mode
+            and gear == "D"
+            and speed < START_ALIGNMENT_MIN_SPEED
+            and abs(steer) > math.radians(8.0)
+        ):
+            rule_speed = min(rule_speed, 1.20)
         target_speed = self.rl_speed.adjust_target_speed(
             rule_speed=rule_speed,
             final_dist=final_dist,
@@ -435,6 +453,7 @@ class PlannerSkeleton:
         straight_clear_full_accel = (
             gear == "D"
             and not in_parking_mode
+            and speed >= START_ALIGNMENT_MIN_SPEED
             and front_is_clear
             and abs(steer) < math.radians(4.0)
         )
@@ -640,6 +659,39 @@ class PlannerSkeleton:
                 current_entry_distance = distance
         return points
 
+    def _prepend_start_alignment(
+        self,
+        path: List[Tuple[float, float]],
+        start: Tuple[float, float, float],
+    ) -> List[Tuple[float, float]]:
+        if len(path) < 2:
+            return path
+        sx, sy, syaw = start
+        forward_point = (
+            sx + math.cos(syaw) * START_ALIGNMENT_DISTANCE,
+            sy + math.sin(syaw) * START_ALIGNMENT_DISTANCE,
+        )
+        if not self._pose_is_collision_free(
+            forward_point[0],
+            forward_point[1],
+            syaw,
+            include_lines=True,
+        ):
+            return path
+
+        corrected = [(sx, sy), forward_point]
+        for point in path[1:]:
+            along_start_yaw = (
+                (point[0] - sx) * math.cos(syaw)
+                + (point[1] - sy) * math.sin(syaw)
+            )
+            if along_start_yaw <= START_ALIGNMENT_DISTANCE + 0.35:
+                continue
+            if math.hypot(point[0] - forward_point[0], point[1] - forward_point[1]) < 0.75:
+                continue
+            corrected.append(point)
+        return corrected
+
     def _ensure_parking_segment(
         self,
         x: float,
@@ -651,13 +703,18 @@ class PlannerSkeleton:
         approach_wp = self.waypoints[-1]
         approach_remaining = math.hypot(approach_wp[0] - x, approach_wp[1] - y)
         target_remaining = math.hypot(target_pose[0] - x, target_pose[1] - y)
-        if (
-            approach_remaining > PARKING_SEGMENT_TRIGGER_DISTANCE
-            and target_remaining > PARKING_ALIGN_DISTANCE + 0.8
-        ):
+        near_approach = approach_remaining <= PARKING_SEGMENT_TRIGGER_DISTANCE
+        near_target = target_remaining <= PARKING_ALIGN_DISTANCE + 0.8
+        if not near_approach and not near_target:
             return
 
         points = self._append_final_alignment([(x, y)], target_pose)
+        if not near_approach and not self._alignment_path_is_clear(points):
+            # Straight-line entry would cut through an obstacle and the
+            # planned approach point has not been reached yet; keep
+            # following the A* path and retry once closer.
+            return
+
         self.waypoints = self._points_to_waypoints(
             points,
             final_yaw=target_pose[2],
@@ -678,6 +735,24 @@ class PlannerSkeleton:
             f" target=({target_pose[0]:.2f}, {target_pose[1]:.2f}, "
             f"yaw={math.degrees(target_pose[2]):.1f}deg)"
         )
+
+    def _alignment_path_is_clear(self, points: List[Tuple[float, float]]) -> bool:
+        step = 0.5
+        for idx in range(len(points) - 1):
+            x0, y0 = points[idx]
+            x1, y1 = points[idx + 1]
+            seg_len = math.hypot(x1 - x0, y1 - y0)
+            if seg_len < 1e-6:
+                continue
+            yaw = math.atan2(y1 - y0, x1 - x0)
+            steps = max(1, int(math.ceil(seg_len / step)))
+            for i in range(steps + 1):
+                t = i / steps
+                px = x0 + (x1 - x0) * t
+                py = y0 + (y1 - y0) * t
+                if self._estimate_pose_clearance(px, py, yaw, include_lines=True) <= 0.0:
+                    return False
+        return True
 
     def _safe_alignment_point(self, point: Tuple[float, float]) -> Tuple[float, float]:
         x, y = point
@@ -728,7 +803,11 @@ class PlannerSkeleton:
             (1, 0, -math.pi / 2.0),
             (1, 1, -math.pi / 4.0),
         ]
-        pose_collisions = self._cached_pose_collision_grid(rows, cols, grid_step)
+        pose_collisions = (
+            self._cached_pose_collision_grid(rows, cols, grid_step)
+            if A_STAR_USE_POSE_GRID
+            else None
+        )
         start_heading = self._heading_index(start_yaw if start_yaw is not None else 0.0)
         goal_heading = self._heading_index(goal_yaw) if goal_yaw is not None else None
         start_state = (start[0], start[1], start_heading)
@@ -757,7 +836,7 @@ class PlannerSkeleton:
                     continue
                 if blocked[nxt[0]][nxt[1]]:
                     continue
-                if pose_collisions[next_heading][nxt[0]][nxt[1]]:
+                if pose_collisions is not None and pose_collisions[next_heading][nxt[0]][nxt[1]]:
                     continue
                 move_cost = math.hypot(dr, dc)
                 turn_penalty = 0.55 * abs(turn)
@@ -929,9 +1008,10 @@ class PlannerSkeleton:
 
         for rect in self._obstacle_rects():
             self._mark_rect(blocked, rect, grid_step, margin=PLANNING_OBSTACLE_MARGIN)
-        # Lines are handled as hard obstacles by the orientation-aware vehicle
-        # footprint grid. Keeping them out of this point grid avoids blocking
-        # entire parking aisles with coarse cells.
+        for rect in self._line_obstacle_rects(half_width=LINE_COLLISION_HALF_WIDTH):
+            self._mark_rect(blocked, rect, grid_step, margin=LINE_HARD_MARGIN)
+        # Lines are simulator collision objects, so the initial point-grid
+        # planner also treats them as hard obstacles.
         return self._inflate_blocked(blocked, radius_cells=0)
 
     def _obstacle_rects(self) -> List[Tuple[float, float, float, float]]:
