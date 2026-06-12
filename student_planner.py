@@ -29,10 +29,13 @@ from rl_speed_controller import RLSpeedController
 
 Waypoint = Tuple[float, float, float, str]  # x, y, desired yaw, gear
 USE_RL_SPEED_CONTROL = False
-VEHICLE_LONGEST_LENGTH = 3.0
-VEHICLE_BOUNDARY_DIAMETER = VEHICLE_LONGEST_LENGTH * 1.20
-VEHICLE_CENTER_CLEARANCE = 0.5 * VEHICLE_BOUNDARY_DIAMETER
-PLANNING_OBSTACLE_MARGIN = VEHICLE_CENTER_CLEARANCE
+VEHICLE_LENGTH = 3.0
+VEHICLE_WIDTH = 1.6
+VEHICLE_FRONT_LENGTH = 1.6
+VEHICLE_REAR_LENGTH = 1.4
+VEHICLE_HALF_WIDTH = 0.5 * VEHICLE_WIDTH
+VEHICLE_RECT_MARGIN = 0.05
+PLANNING_OBSTACLE_MARGIN = VEHICLE_RECT_MARGIN
 EXTRA_SAFETY_MARGIN = 0.0
 OBSTACLE_SLOW_DISTANCE = 1.15
 OBSTACLE_STOP_DISTANCE = 0.45
@@ -41,6 +44,7 @@ FRONT_CLEAR_SPEED_BONUS = 0.75
 PARKING_ALIGN_DISTANCE = 4.0
 FINAL_ALIGNMENT_DISTANCES = (3.4, 2.4, 1.45, 0.75, 0.35, 0.0)
 FINAL_ALIGN_CLEARANCE_MIN = 0.10
+PARKING_SEGMENT_TRIGGER_DISTANCE = 1.25
 PARKING_REVERSE_YAW_ERROR = math.radians(32.0)
 PARKING_REVERSE_TICKS = 58
 PARKING_REVERSE_COOLDOWN_TICKS = 45
@@ -48,7 +52,10 @@ PARKING_REVERSE_WALL_CLEARANCE = 0.85
 PARKING_REVERSE_REARM_CLEARANCE = 0.65
 PARKING_REVERSE_REARM_DISTANCE = 0.90
 PARKING_TARGET_OVERSHOOT = 0.30
-LINE_EXTRA_CLEARANCE = PLANNING_OBSTACLE_MARGIN * 0.20
+LINE_EXTRA_CLEARANCE = 0.20
+LINE_COLLISION_HALF_WIDTH = 0.25
+LINE_HARD_MARGIN = 0.05
+A_STAR_GRID_STEP = 2.00
 A_STAR_MAX_HEADING_STEP = 1  # 8-heading grid: one step means at most 45 degrees.
 
 
@@ -86,11 +93,13 @@ class PlannerSkeleton:
     planning_fail_reason: Optional[str] = None
     blocked_grid_cache: Optional[Tuple[int, int, float, List[List[bool]]]] = None
     line_penalty_grid_cache: Optional[Tuple[int, int, float, List[List[float]]]] = None
+    pose_collision_grid_cache: Optional[Tuple[int, int, float, List[List[List[bool]]]]] = None
     parking_reverse_ticks: int = 0
     parking_reverse_cooldown: int = 0
     parking_has_reversed: bool = False
     parking_reverse_completed: bool = False
     parking_last_reverse_end: Optional[Tuple[float, float]] = None
+    parking_segment_ready: bool = False
 
     def __post_init__(self) -> None:
         if self.waypoints is None:
@@ -119,13 +128,15 @@ class PlannerSkeleton:
         self.planning_fail_reason = None
         self.blocked_grid_cache = None
         self.line_penalty_grid_cache = None
+        self.pose_collision_grid_cache = None
         self.parking_reverse_ticks = 0
         self.parking_reverse_cooldown = 0
         self.parking_has_reversed = False
         self.parking_reverse_completed = False
         self.parking_last_reverse_end = None
+        self.parking_segment_ready = False
         self.rl_speed = RLSpeedController(enabled=USE_RL_SPEED_CONTROL)
-        self._warm_planning_caches()
+        self._warm_planning_caches(warm_pose_grid=False)
         print(f"[algo] rl_speed_control={'ON' if USE_RL_SPEED_CONTROL else 'OFF'}")
 
     def compute_path(self, obs: Dict[str, Any]) -> None:
@@ -138,6 +149,7 @@ class PlannerSkeleton:
         self.parking_has_reversed = False
         self.parking_reverse_completed = False
         self.parking_last_reverse_end = None
+        self.parking_segment_ready = False
         state = obs.get("state", {})
         start = (
             float(state.get("x", 0.0)),
@@ -175,21 +187,19 @@ class PlannerSkeleton:
             )
 
         simplified = self._simplify_path(grid_path, spacing=1.0)
-        parking_start_index = max(0, len(simplified) - 1)
-        points = self._append_final_alignment(simplified, target_pose)
+        points = simplified
         self.waypoints = self._points_to_waypoints(
             points,
-            final_yaw=target_pose[2],
+            final_yaw=points[-1][2] if points and len(points[-1]) > 2 else target_pose[2],
             gear="D",
-            target_pose=target_pose,
-            parking_start_index=parking_start_index,
         )
 
-        initial_clearance = self._estimate_min_obstacle_distance((start[0], start[1]))
+        initial_clearance = self._estimate_min_obstacle_distance((start[0], start[1]), yaw=start[2])
         self.min_obstacle_distance = min(self.min_obstacle_distance, initial_clearance)
         print(
             "[algo] path ready:"
             f" waypoints={len(self.waypoints)}"
+            f" stage=approach_only"
             f" target=({target_pose[0]:.2f}, {target_pose[1]:.2f}, "
             f"yaw={math.degrees(target_pose[2]):.1f}deg)"
             f" min_obstacle_dist~{initial_clearance:.2f}m"
@@ -220,16 +230,20 @@ class PlannerSkeleton:
         final_wp = self.waypoints[-1]
         if len(slot) == 4:
             target_center = self._slot_center(slot)
+            target_pose = self._target_pose(slot)
+            final_yaw = target_pose[2]
             final_dist = math.hypot(target_center[0] - x, target_center[1] - y)
             center_tolerance = self._slot_center_tolerance(slot)
             slot_entered = self._point_in_slot(slot, x, y, margin=0.05)
         else:
             target_center = (final_wp[0], final_wp[1])
+            target_pose = (final_wp[0], final_wp[1], final_wp[2])
+            final_yaw = final_wp[2]
             final_dist = math.hypot(final_wp[0] - x, final_wp[1] - y)
             center_tolerance = 0.55
             slot_entered = False
-        final_yaw_error = abs(self._wrap_to_pi(final_wp[2] - yaw))
-        obstacle_dist = self._estimate_min_obstacle_distance((x, y))
+        final_yaw_error = abs(self._wrap_to_pi(final_yaw - yaw))
+        obstacle_dist = self._estimate_min_obstacle_distance((x, y), yaw=yaw)
         self.min_obstacle_distance = min(self.min_obstacle_distance, obstacle_dist)
         collision_risk = False
 
@@ -250,10 +264,17 @@ class PlannerSkeleton:
                     f" yaw_error={math.degrees(final_yaw_error):.1f}deg"
                     f" steps={self.step_count}"
                     f" min_obstacle_dist~{self.min_obstacle_distance:.2f}m"
-                )
+            )
             return {"steer": 0.0, "accel": 0.0, "brake": 1.0, "gear": "D"}
 
         self._advance_waypoint_index(x, y)
+        if len(slot) == 4:
+            self._ensure_parking_segment(
+                x=x,
+                y=y,
+                target_pose=target_pose,
+            )
+            final_wp = self.waypoints[-1]
         in_parking_mode = final_dist < PARKING_ALIGN_DISTANCE
         tracking_reference = self.waypoints[min(self.waypoint_index + 1, len(self.waypoints) - 1)]
         tracking_yaw_error = self._tracking_yaw_error(
@@ -281,7 +302,7 @@ class PlannerSkeleton:
             x=x,
             y=y,
             target_center=target_center,
-            target_yaw=final_wp[2],
+            target_yaw=final_yaw,
             tolerance=max(center_tolerance, PARKING_TARGET_OVERSHOOT),
         )
         if self.parking_reverse_cooldown > 0:
@@ -339,7 +360,7 @@ class PlannerSkeleton:
                 self.parking_reverse_cooldown = PARKING_REVERSE_COOLDOWN_TICKS
                 self.parking_reverse_completed = True
                 self.parking_last_reverse_end = (x, y)
-            target_wp = self._parking_reverse_target(target_center, final_wp[2])
+            target_wp = self._parking_reverse_target(target_center, final_yaw)
             gear = "R"
             reverse_realigning = True
         elif in_parking_mode:
@@ -348,7 +369,7 @@ class PlannerSkeleton:
                 y=y,
                 planned_target=target_wp,
                 target_center=target_center,
-                final_yaw=final_wp[2],
+                final_yaw=final_yaw,
             )
             gear = target_wp[3]
         if in_parking_mode:
@@ -494,7 +515,7 @@ class PlannerSkeleton:
     def _approach_pose(self, slot: List[float], target_yaw: float) -> Tuple[float, float, float]:
         cx, cy = self._slot_center(slot)
         above = (cx, cy + 3.0, target_yaw)
-        if self._is_valid_approach_point(above[0], above[1]):
+        if self._is_valid_approach_point(above[0], above[1], target_yaw):
             return above
         return cx, cy - 3.0, target_yaw
 
@@ -507,17 +528,17 @@ class PlannerSkeleton:
         above = (cx, cy + 3.0, target_yaw)
         below = (cx, cy - 3.0, target_yaw)
         candidates: List[Tuple[float, float, float]] = []
-        if self._is_valid_approach_point(above[0], above[1]):
+        if self._is_valid_approach_point(above[0], above[1], target_yaw):
             candidates.append(above)
-        elif self._is_valid_approach_point(below[0], below[1]):
+        elif self._is_valid_approach_point(below[0], below[1], target_yaw):
             candidates.append(below)
         if candidates:
             return candidates
         fallback_x, fallback_y = self._clamp_inside_map(below[0], below[1])
         return [(fallback_x, fallback_y, target_yaw)]
 
-    def _is_valid_approach_point(self, x: float, y: float) -> bool:
-        return self._inside_map(x, y) and self._estimate_min_obstacle_distance((x, y)) > 0.20
+    def _is_valid_approach_point(self, x: float, y: float, yaw: float) -> bool:
+        return self._pose_is_collision_free(x, y, yaw, include_lines=True)
 
     def _select_best_plan(
         self,
@@ -533,12 +554,15 @@ class PlannerSkeleton:
                 start_xy,
                 (candidate[0], candidate[1]),
                 start_yaw=start_yaw,
-                goal_yaw=candidate[2],
+                goal_yaw=None,
             )
             if not grid_path:
                 continue
             path_len = self._path_length(grid_path)
-            clearance = self._estimate_min_obstacle_distance((candidate[0], candidate[1]))
+            clearance = self._estimate_min_obstacle_distance(
+                (candidate[0], candidate[1]),
+                yaw=candidate[2],
+            )
             final_leg = math.hypot(target_pose[0] - candidate[0], target_pose[1] - candidate[1])
             yaw_align = abs(self._wrap_to_pi(candidate[2] - target_pose[2]))
             clearance_penalty = 8.0 / max(clearance, 0.20)
@@ -616,6 +640,45 @@ class PlannerSkeleton:
                 current_entry_distance = distance
         return points
 
+    def _ensure_parking_segment(
+        self,
+        x: float,
+        y: float,
+        target_pose: Tuple[float, float, float],
+    ) -> None:
+        if self.parking_segment_ready or not self.waypoints:
+            return
+        approach_wp = self.waypoints[-1]
+        approach_remaining = math.hypot(approach_wp[0] - x, approach_wp[1] - y)
+        target_remaining = math.hypot(target_pose[0] - x, target_pose[1] - y)
+        if (
+            approach_remaining > PARKING_SEGMENT_TRIGGER_DISTANCE
+            and target_remaining > PARKING_ALIGN_DISTANCE + 0.8
+        ):
+            return
+
+        points = self._append_final_alignment([(x, y)], target_pose)
+        self.waypoints = self._points_to_waypoints(
+            points,
+            final_yaw=target_pose[2],
+            gear="D",
+            target_pose=target_pose,
+            parking_start_index=0,
+        )
+        self.waypoint_index = 0
+        self.parking_segment_ready = True
+        self.parking_reverse_ticks = 0
+        self.parking_reverse_cooldown = 0
+        self.parking_has_reversed = False
+        self.parking_reverse_completed = False
+        self.parking_last_reverse_end = None
+        print(
+            "[algo] parking segment ready:"
+            f" waypoints={len(self.waypoints)}"
+            f" target=({target_pose[0]:.2f}, {target_pose[1]:.2f}, "
+            f"yaw={math.degrees(target_pose[2]):.1f}deg)"
+        )
+
     def _safe_alignment_point(self, point: Tuple[float, float]) -> Tuple[float, float]:
         x, y = point
         if not self._inside_map(x, y, margin=0.2):
@@ -634,7 +697,7 @@ class PlannerSkeleton:
         if self.map_extent is None:
             return []
         xmin, xmax, ymin, ymax = self.map_extent
-        grid_step = max(self.cell_size, 0.75)
+        grid_step = max(self.cell_size, A_STAR_GRID_STEP)
         cols = max(1, int(math.ceil((xmax - xmin) / grid_step)))
         rows = max(1, int(math.ceil((ymax - ymin) / grid_step)))
         blocked = self._cached_blocked_grid(rows, cols, grid_step)
@@ -665,6 +728,7 @@ class PlannerSkeleton:
             (1, 0, -math.pi / 2.0),
             (1, 1, -math.pi / 4.0),
         ]
+        pose_collisions = self._cached_pose_collision_grid(rows, cols, grid_step)
         start_heading = self._heading_index(start_yaw if start_yaw is not None else 0.0)
         goal_heading = self._heading_index(goal_yaw) if goal_yaw is not None else None
         start_state = (start[0], start[1], start_heading)
@@ -692,6 +756,8 @@ class PlannerSkeleton:
                 if not (0 <= nxt[0] < rows and 0 <= nxt[1] < cols):
                     continue
                 if blocked[nxt[0]][nxt[1]]:
+                    continue
+                if pose_collisions[next_heading][nxt[0]][nxt[1]]:
                     continue
                 move_cost = math.hypot(dr, dc)
                 turn_penalty = 0.55 * abs(turn)
@@ -737,15 +803,17 @@ class PlannerSkeleton:
             return True
         return self._heading_index_distance(heading, goal_heading) <= 1
 
-    def _warm_planning_caches(self) -> None:
+    def _warm_planning_caches(self, warm_pose_grid: bool = True) -> None:
         if self.map_extent is None:
             return
         xmin, xmax, ymin, ymax = self.map_extent
-        grid_step = max(self.cell_size, 0.75)
+        grid_step = max(self.cell_size, A_STAR_GRID_STEP)
         cols = max(1, int(math.ceil((xmax - xmin) / grid_step)))
         rows = max(1, int(math.ceil((ymax - ymin) / grid_step)))
         self._cached_blocked_grid(rows, cols, grid_step)
         self._cached_line_penalty_grid(rows, cols, grid_step)
+        if warm_pose_grid:
+            self._cached_pose_collision_grid(rows, cols, grid_step)
 
     def _cached_blocked_grid(self, rows: int, cols: int, grid_step: float) -> List[List[bool]]:
         if (
@@ -769,11 +837,57 @@ class PlannerSkeleton:
             self.line_penalty_grid_cache = (rows, cols, grid_step, penalties)
         return self.line_penalty_grid_cache[3]
 
+    def _cached_pose_collision_grid(
+        self,
+        rows: int,
+        cols: int,
+        grid_step: float,
+    ) -> List[List[List[bool]]]:
+        if (
+            self.pose_collision_grid_cache is None
+            or self.pose_collision_grid_cache[0] != rows
+            or self.pose_collision_grid_cache[1] != cols
+            or abs(self.pose_collision_grid_cache[2] - grid_step) > 1e-9
+        ):
+            grids = self._build_pose_collision_grid(rows, cols, grid_step)
+            self.pose_collision_grid_cache = (rows, cols, grid_step, grids)
+        return self.pose_collision_grid_cache[3]
+
+    def _build_pose_collision_grid(
+        self,
+        rows: int,
+        cols: int,
+        grid_step: float,
+    ) -> List[List[List[bool]]]:
+        headings = [
+            0.0,
+            math.pi / 4.0,
+            math.pi / 2.0,
+            3.0 * math.pi / 4.0,
+            math.pi,
+            -3.0 * math.pi / 4.0,
+            -math.pi / 2.0,
+            -math.pi / 4.0,
+        ]
+        grids = [[[False for _ in range(cols)] for _ in range(rows)] for _ in headings]
+        if self.map_extent is None:
+            return grids
+        xmin, _, _, ymax = self.map_extent
+        rects = self._collision_rects(include_lines=True)
+        for heading_idx, heading in enumerate(headings):
+            grid = grids[heading_idx]
+            for row in range(rows):
+                y = ymax - (row + 0.5) * grid_step
+                for col in range(cols):
+                    x = xmin + (col + 0.5) * grid_step
+                    grid[row][col] = self._pose_collides_with_rects(x, y, heading, rects)
+        return grids
+
     def _build_line_penalty_grid(self, rows: int, cols: int, grid_step: float) -> List[List[float]]:
         penalties = [[0.0 for _ in range(cols)] for _ in range(rows)]
         if self.map_extent is None:
             return penalties
-        line_rects = self._line_obstacle_rects(half_width=0.08)
+        line_rects = self._line_obstacle_rects(half_width=LINE_COLLISION_HALF_WIDTH)
         if not line_rects:
             return penalties
         margin = PLANNING_OBSTACLE_MARGIN + LINE_EXTRA_CLEARANCE
@@ -815,8 +929,9 @@ class PlannerSkeleton:
 
         for rect in self._obstacle_rects():
             self._mark_rect(blocked, rect, grid_step, margin=PLANNING_OBSTACLE_MARGIN)
-        # Lines are soft planning penalties, not hard obstacles. Hard-block
-        # occupied slots and walls only so A* can still enter parking slots.
+        # Lines are handled as hard obstacles by the orientation-aware vehicle
+        # footprint grid. Keeping them out of this point grid avoids blocking
+        # entire parking aisles with coarse cells.
         return self._inflate_blocked(blocked, radius_cells=0)
 
     def _obstacle_rects(self) -> List[Tuple[float, float, float, float]]:
@@ -918,10 +1033,14 @@ class PlannerSkeleton:
             for dc in range(-radius, radius + 1):
                 rr = cell[0] + dr
                 cc = cell[1] + dc
-                if 0 <= rr < rows and 0 <= cc < cols and not self._cell_hits_wall(rr, cc, grid_step):
+                if (
+                    0 <= rr < rows
+                    and 0 <= cc < cols
+                    and not self._cell_hits_protected_obstacle(rr, cc, grid_step)
+                ):
                     blocked[rr][cc] = False
 
-    def _cell_hits_wall(self, row: int, col: int, grid_step: float) -> bool:
+    def _cell_hits_protected_obstacle(self, row: int, col: int, grid_step: float) -> bool:
         if self.map_extent is None or not self.map_data:
             return False
         xmin, _, _, ymax = self.map_extent
@@ -929,6 +1048,14 @@ class PlannerSkeleton:
         y = ymax - (row + 0.5) * grid_step
         for rect in self.map_data.get("walls_rects") or []:
             rx0, rx1, ry0, ry1 = (float(v) for v in rect)
+            if rx0 <= x <= rx1 and ry0 <= y <= ry1:
+                return True
+        line_margin = LINE_HARD_MARGIN
+        for rx0, rx1, ry0, ry1 in self._line_obstacle_rects(half_width=LINE_COLLISION_HALF_WIDTH):
+            rx0 -= line_margin
+            rx1 += line_margin
+            ry0 -= line_margin
+            ry1 += line_margin
             if rx0 <= x <= rx1 and ry0 <= y <= ry1:
                 return True
         return False
@@ -1106,14 +1233,14 @@ class PlannerSkeleton:
         if self.map_extent is None:
             return True
         xmin, xmax, ymin, ymax = self.map_extent
-        margin = max(margin, VEHICLE_CENTER_CLEARANCE + EXTRA_SAFETY_MARGIN)
+        margin = max(margin, VEHICLE_HALF_WIDTH + VEHICLE_RECT_MARGIN + EXTRA_SAFETY_MARGIN)
         return xmin + margin <= x <= xmax - margin and ymin + margin <= y <= ymax - margin
 
     def _clamp_inside_map(self, x: float, y: float, margin: float = 0.4) -> Tuple[float, float]:
         if self.map_extent is None:
             return x, y
         xmin, xmax, ymin, ymax = self.map_extent
-        margin = max(margin, VEHICLE_CENTER_CLEARANCE + EXTRA_SAFETY_MARGIN)
+        margin = max(margin, VEHICLE_HALF_WIDTH + VEHICLE_RECT_MARGIN + EXTRA_SAFETY_MARGIN)
         return (
             max(xmin + margin, min(xmax - margin, x)),
             max(ymin + margin, min(ymax - margin, y)),
@@ -1176,14 +1303,17 @@ class PlannerSkeleton:
             px += direction * math.cos(pyaw) * step
             py += direction * math.sin(pyaw) * step
             distance += step
-            if self._estimate_clearance(
-                (px, py),
-                include_lines=True,
-            ) <= 0.05:
+            if self._estimate_pose_clearance(px, py, pyaw, include_lines=True) <= 0.05:
                 return distance
         return max_distance
 
-    def _estimate_min_obstacle_distance(self, point: Tuple[float, float]) -> float:
+    def _estimate_min_obstacle_distance(
+        self,
+        point: Tuple[float, float],
+        yaw: Optional[float] = None,
+    ) -> float:
+        if yaw is not None:
+            return self._estimate_pose_clearance(point[0], point[1], yaw, include_lines=False)
         return self._estimate_clearance(point, include_lines=False)
 
     def _estimate_clearance(
@@ -1198,12 +1328,181 @@ class PlannerSkeleton:
             best = min(best, px - xmin, xmax - px, py - ymin, ymax - py)
         rects = self._obstacle_rects()
         if include_lines:
-            rects = rects + self._line_obstacle_rects(half_width=0.08)
+            rects = rects + self._line_obstacle_rects(half_width=LINE_COLLISION_HALF_WIDTH)
         for rx0, rx1, ry0, ry1 in rects:
             dx = max(rx0 - px, 0.0, px - rx1)
             dy = max(ry0 - py, 0.0, py - ry1)
             best = min(best, math.hypot(dx, dy))
-        return max(0.0, best - VEHICLE_CENTER_CLEARANCE - EXTRA_SAFETY_MARGIN)
+        return max(0.0, best - VEHICLE_HALF_WIDTH - VEHICLE_RECT_MARGIN - EXTRA_SAFETY_MARGIN)
+
+    def _estimate_pose_clearance(
+        self,
+        x: float,
+        y: float,
+        yaw: float,
+        include_lines: bool = False,
+    ) -> float:
+        vehicle_poly = self._vehicle_polygon(x, y, yaw, margin=VEHICLE_RECT_MARGIN)
+        if self._polygon_outside_map(vehicle_poly):
+            return 0.0
+        rects = self._obstacle_rects()
+        if include_lines:
+            rects = rects + self._line_obstacle_rects(half_width=LINE_COLLISION_HALF_WIDTH)
+        best = self._polygon_map_clearance(vehicle_poly)
+        for rect in rects:
+            rect_poly = self._rect_polygon(rect)
+            if self._polygons_intersect(vehicle_poly, rect_poly):
+                return 0.0
+            best = min(best, self._polygon_distance(vehicle_poly, rect_poly))
+        return max(0.0, best - EXTRA_SAFETY_MARGIN)
+
+    def _pose_is_collision_free(
+        self,
+        x: float,
+        y: float,
+        yaw: float,
+        include_lines: bool,
+    ) -> bool:
+        return self._estimate_pose_clearance(x, y, yaw, include_lines=include_lines) > 0.0
+
+    def _collision_rects(self, include_lines: bool) -> List[Tuple[float, float, float, float]]:
+        rects = self._obstacle_rects()
+        if include_lines:
+            rects = rects + self._line_obstacle_rects(half_width=LINE_COLLISION_HALF_WIDTH)
+        return rects
+
+    def _pose_collides_with_rects(
+        self,
+        x: float,
+        y: float,
+        yaw: float,
+        rects: List[Tuple[float, float, float, float]],
+    ) -> bool:
+        vehicle_poly = self._vehicle_polygon(x, y, yaw, margin=VEHICLE_RECT_MARGIN)
+        if self._polygon_outside_map(vehicle_poly):
+            return True
+        vx0 = min(point[0] for point in vehicle_poly)
+        vx1 = max(point[0] for point in vehicle_poly)
+        vy0 = min(point[1] for point in vehicle_poly)
+        vy1 = max(point[1] for point in vehicle_poly)
+        for rect in rects:
+            rx0, rx1, ry0, ry1 = rect
+            if vx1 < rx0 or rx1 < vx0 or vy1 < ry0 or ry1 < vy0:
+                continue
+            if self._polygons_intersect(vehicle_poly, self._rect_polygon(rect)):
+                return True
+        return False
+
+    def _vehicle_polygon(
+        self,
+        x: float,
+        y: float,
+        yaw: float,
+        margin: float = 0.0,
+    ) -> List[Tuple[float, float]]:
+        front = VEHICLE_FRONT_LENGTH + margin
+        rear = VEHICLE_REAR_LENGTH + margin
+        half_width = VEHICLE_HALF_WIDTH + margin
+        local_points = [
+            (front, half_width),
+            (front, -half_width),
+            (-rear, -half_width),
+            (-rear, half_width),
+        ]
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        return [
+            (
+                x + lx * cos_yaw - ly * sin_yaw,
+                y + lx * sin_yaw + ly * cos_yaw,
+            )
+            for lx, ly in local_points
+        ]
+
+    def _rect_polygon(self, rect: Tuple[float, float, float, float]) -> List[Tuple[float, float]]:
+        rx0, rx1, ry0, ry1 = rect
+        return [(rx0, ry0), (rx1, ry0), (rx1, ry1), (rx0, ry1)]
+
+    def _polygon_outside_map(self, poly: List[Tuple[float, float]]) -> bool:
+        if self.map_extent is None:
+            return False
+        xmin, xmax, ymin, ymax = self.map_extent
+        return any(x < xmin or x > xmax or y < ymin or y > ymax for x, y in poly)
+
+    def _polygon_map_clearance(self, poly: List[Tuple[float, float]]) -> float:
+        if self.map_extent is None:
+            return float("inf")
+        xmin, xmax, ymin, ymax = self.map_extent
+        return min(min(x - xmin, xmax - x, y - ymin, ymax - y) for x, y in poly)
+
+    def _polygons_intersect(
+        self,
+        poly_a: List[Tuple[float, float]],
+        poly_b: List[Tuple[float, float]],
+    ) -> bool:
+        for poly in (poly_a, poly_b):
+            for idx in range(len(poly)):
+                x1, y1 = poly[idx]
+                x2, y2 = poly[(idx + 1) % len(poly)]
+                axis = (-(y2 - y1), x2 - x1)
+                length = math.hypot(axis[0], axis[1])
+                if length <= 1e-9:
+                    continue
+                axis = (axis[0] / length, axis[1] / length)
+                min_a, max_a = self._project_polygon(poly_a, axis)
+                min_b, max_b = self._project_polygon(poly_b, axis)
+                if max_a < min_b or max_b < min_a:
+                    return False
+        return True
+
+    def _project_polygon(
+        self,
+        poly: List[Tuple[float, float]],
+        axis: Tuple[float, float],
+    ) -> Tuple[float, float]:
+        values = [x * axis[0] + y * axis[1] for x, y in poly]
+        return min(values), max(values)
+
+    def _polygon_distance(
+        self,
+        poly_a: List[Tuple[float, float]],
+        poly_b: List[Tuple[float, float]],
+    ) -> float:
+        best = float("inf")
+        for point in poly_a:
+            best = min(best, self._point_to_polygon_distance(point, poly_b))
+        for point in poly_b:
+            best = min(best, self._point_to_polygon_distance(point, poly_a))
+        return best
+
+    def _point_to_polygon_distance(
+        self,
+        point: Tuple[float, float],
+        poly: List[Tuple[float, float]],
+    ) -> float:
+        return min(
+            self._point_to_segment_distance(point, poly[idx], poly[(idx + 1) % len(poly)])
+            for idx in range(len(poly))
+        )
+
+    def _point_to_segment_distance(
+        self,
+        point: Tuple[float, float],
+        start: Tuple[float, float],
+        end: Tuple[float, float],
+    ) -> float:
+        px, py = point
+        x1, y1 = start
+        x2, y2 = end
+        dx = x2 - x1
+        dy = y2 - y1
+        length_sq = dx * dx + dy * dy
+        if length_sq <= 1e-12:
+            return math.hypot(px - x1, py - y1)
+        t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / length_sq))
+        proj_x = x1 + t * dx
+        proj_y = y1 + t * dy
+        return math.hypot(px - proj_x, py - proj_y)
 
     def _log_evaluation(
         self,
