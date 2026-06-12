@@ -245,11 +245,20 @@ class PlannerSkeleton:
             return {"steer": 0.0, "accel": 0.0, "brake": 1.0, "gear": "D"}
 
         self._advance_waypoint_index(x, y)
-        lookahead = self._adaptive_lookahead(speed, final_dist, final_yaw_error)
+        in_parking_mode = final_dist < PARKING_ALIGN_DISTANCE
+        tracking_reference = self.waypoints[min(self.waypoint_index + 1, len(self.waypoints) - 1)]
+        tracking_yaw_error = self._tracking_yaw_error(
+            x=x,
+            y=y,
+            yaw=yaw,
+            target_wp=tracking_reference,
+            reverse=False,
+        )
+        control_yaw_error = final_yaw_error if in_parking_mode else tracking_yaw_error
+        lookahead = self._adaptive_lookahead(speed, final_dist, control_yaw_error)
         target_idx = self._lookahead_index(x, y, lookahead=lookahead)
         target_wp = self.waypoints[target_idx]
         gear = target_wp[3]
-        in_parking_mode = final_dist < PARKING_ALIGN_DISTANCE
         reverse_realigning = False
         forward_clearance = self._estimate_forward_clearance(
             x=x,
@@ -326,6 +335,16 @@ class PlannerSkeleton:
         elif in_parking_mode:
             target_wp = (target_center[0], target_center[1], final_wp[2], "D")
             gear = "D"
+        if in_parking_mode:
+            control_yaw_error = final_yaw_error
+        else:
+            control_yaw_error = self._tracking_yaw_error(
+                x=x,
+                y=y,
+                yaw=yaw,
+                target_wp=target_wp,
+                reverse=(gear == "R"),
+            )
 
         steer = self._pure_pursuit_steer(
             x=x,
@@ -363,7 +382,7 @@ class PlannerSkeleton:
         front_is_clear = front_clearance >= FRONT_CLEAR_DISTANCE
         rule_speed = self._target_speed(
             final_dist,
-            final_yaw_error,
+            control_yaw_error,
             steer,
             front_clearance,
         )
@@ -372,7 +391,7 @@ class PlannerSkeleton:
         target_speed = self.rl_speed.adjust_target_speed(
             rule_speed=rule_speed,
             final_dist=final_dist,
-            yaw_error=final_yaw_error,
+            yaw_error=control_yaw_error,
             steer_abs=abs(steer),
             obstacle_dist=front_clearance,
         )
@@ -405,7 +424,8 @@ class PlannerSkeleton:
                 f" pos_error={final_dist:.2f}m"
                 f" center_tolerance={center_tolerance:.2f}m"
                 f" slot_entered={slot_entered}"
-                f" yaw_error={math.degrees(final_yaw_error):.1f}deg"
+                f" tracking_yaw_error={math.degrees(tracking_yaw_error):.1f}deg"
+                f" final_yaw_error={math.degrees(final_yaw_error):.1f}deg"
                 f" min_obstacle_dist~{self.min_obstacle_distance:.2f}m"
                 f" front_clearance~{front_clearance:.2f}m"
                 f" gear={gear}"
@@ -938,6 +958,18 @@ class PlannerSkeleton:
         if reverse:
             steer = -steer
         return max(-max_steer, min(max_steer, steer))
+
+    def _tracking_yaw_error(
+        self,
+        x: float,
+        y: float,
+        yaw: float,
+        target_wp: Waypoint,
+        reverse: bool,
+    ) -> float:
+        target_heading = math.atan2(target_wp[1] - y, target_wp[0] - x)
+        tracking_yaw = self._wrap_to_pi(yaw + math.pi) if reverse else yaw
+        return abs(self._wrap_to_pi(target_heading - tracking_yaw))
 
     def _parking_reverse_target(
         self,
