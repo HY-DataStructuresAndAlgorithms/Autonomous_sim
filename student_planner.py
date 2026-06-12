@@ -81,6 +81,10 @@ PREVIEW_MAX_BRAKE = 4.5
 PREVIEW_STEER_RATE = math.radians(240.0)
 SPATIAL_INDEX_CELL_SIZE = 4.0
 CLEARANCE_QUERY_RADIUS = 8.0
+RISK_FIELD_SIGMA = 1.0
+POSE_Q_SIGMA = 5.0
+POSE_Q_FAR = (1.0, 1.1, 0.35)
+POSE_Q_NEAR = (1.0, 3.0, 7.0)
 
 
 def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
@@ -762,7 +766,7 @@ class PlannerSkeleton:
         expected = str((self.map_data or {}).get("expected_orientation") or "").lower()
         if semantic_plan is not None:
             plans.append(semantic_plan)
-            if semantic_plan.preview_reason == "success":
+            if semantic_plan.preview_reason in {"success", "rear_turnaround"}:
                 return semantic_plan
             if not expected.startswith("rear") and semantic_plan.preview_reason != "collision":
                 return semantic_plan
@@ -900,6 +904,7 @@ class PlannerSkeleton:
                 self._guided_path_clearance(grid_path),
                 self._guided_final_alignment_clearance((candidate[0], candidate[1]), target_pose),
             )
+            risk = math.exp(-(clearance * clearance) / (2.0 * RISK_FIELD_SIGMA * RISK_FIELD_SIGMA))
             ray_error = self._approach_ray_error((candidate[0], candidate[1]), target_pose)
             lateral = self._target_axis_lateral_offset((candidate[0], candidate[1]), target_pose)
             radial = abs(final_leg - 3.2)
@@ -908,7 +913,8 @@ class PlannerSkeleton:
             cost = (
                 1.10 * path_len
                 + 0.55 * final_leg
-                + 1.15 / max(clearance, 0.25)
+                + 0.55 / max(clearance, 0.25)
+                + 1.8 * risk
                 + 3.4 * ray_error
                 + 0.75 * lateral
                 + 0.25 * radial
@@ -1706,9 +1712,19 @@ class PlannerSkeleton:
             )
 
         def heuristic(x: float, y: float, yaw: float) -> float:
-            dist = math.hypot(tx - x, ty - y)
+            dx = x - tx
+            dy = y - ty
+            dist = math.hypot(dx, dy)
+            forward = (math.cos(tyaw), math.sin(tyaw))
+            lateral = (-math.sin(tyaw), math.cos(tyaw))
+            e_long = dx * forward[0] + dy * forward[1]
+            e_lat = dx * lateral[0] + dy * lateral[1]
             yaw_err = abs(self._wrap_to_pi(tyaw - yaw))
-            return dist + (0.6 if dist > 6.0 else 1.8) * yaw_err
+            lam = math.exp(-dist / POSE_Q_SIGMA)
+            q_long = POSE_Q_FAR[0] + lam * (POSE_Q_NEAR[0] - POSE_Q_FAR[0])
+            q_lat = POSE_Q_FAR[1] + lam * (POSE_Q_NEAR[1] - POSE_Q_FAR[1])
+            q_yaw = POSE_Q_FAR[2] + lam * (POSE_Q_NEAR[2] - POSE_Q_FAR[2])
+            return math.sqrt(q_long * e_long * e_long + q_lat * e_lat * e_lat + q_yaw * yaw_err * yaw_err)
 
         def is_goal(x: float, y: float, yaw: float) -> bool:
             return math.hypot(tx - x, ty - y) < 0.75 and abs(self._wrap_to_pi(tyaw - yaw)) < math.radians(16.0)
