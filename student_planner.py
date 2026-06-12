@@ -256,6 +256,8 @@ class PlannerSkeleton:
             y=y,
             yaw=yaw,
             reverse=False,
+            steer=0.0,
+            wheelbase=wheelbase,
         )
         target_overshot = self._passed_target_center(
             x=x,
@@ -343,6 +345,8 @@ class PlannerSkeleton:
             y=y,
             yaw=yaw,
             reverse=(gear == "R"),
+            steer=steer,
+            wheelbase=wheelbase,
         )
         collision_risk = front_clearance < OBSTACLE_STOP_DISTANCE
         if collision_risk and final_dist > 1.0:
@@ -1038,20 +1042,26 @@ class PlannerSkeleton:
         y: float,
         yaw: float,
         reverse: bool = False,
+        steer: float = 0.0,
+        wheelbase: float = 2.6,
         max_distance: float = FRONT_CLEAR_DISTANCE,
     ) -> float:
-        heading = self._wrap_to_pi(yaw + math.pi) if reverse else yaw
-        step = 0.5
-        distance = step
-        while distance <= max_distance:
-            px = x + math.cos(heading) * distance
-            py = y + math.sin(heading) * distance
+        step = 0.35
+        distance = 0.0
+        direction = -1.0 if reverse else 1.0
+        px, py, pyaw = x, y, yaw
+        curvature = math.tan(steer) / max(wheelbase, 1e-6)
+
+        while distance < max_distance:
+            pyaw = self._wrap_to_pi(pyaw + direction * curvature * step)
+            px += direction * math.cos(pyaw) * step
+            py += direction * math.sin(pyaw) * step
+            distance += step
             if self._estimate_clearance(
                 (px, py),
                 include_lines=True,
             ) <= 0.05:
                 return distance
-            distance += step
         return max_distance
 
     def _estimate_min_obstacle_distance(self, point: Tuple[float, float]) -> float:
