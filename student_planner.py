@@ -48,8 +48,9 @@ PARKING_ALIGN_DISTANCE = 4.0
 PARKING_REVERSE_YAW_ERROR = math.radians(32.0)
 PARKING_REVERSE_TICKS = 58
 PARKING_REVERSE_COOLDOWN_TICKS = 45
-APPROACH_TURN_PENALTY = 2.35
-APPROACH_STRAIGHT_CLEARANCE = 0.35
+PARKING_REVERSE_WALL_CLEARANCE = 0.85
+PARKING_TARGET_OVERSHOOT = 0.30
+LINE_EXTRA_CLEARANCE = PLANNING_OBSTACLE_MARGIN * 0.20
 
 
 def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
@@ -85,8 +86,10 @@ class PlannerSkeleton:
     final_eval_logged: bool = False
     planning_fail_reason: Optional[str] = None
     blocked_grid_cache: Optional[Tuple[int, int, float, List[List[bool]]]] = None
+    line_penalty_grid_cache: Optional[Tuple[int, int, float, List[List[float]]]] = None
     parking_reverse_ticks: int = 0
     parking_reverse_cooldown: int = 0
+    parking_has_reversed: bool = False
 
     def __post_init__(self) -> None:
         if self.waypoints is None:
@@ -114,9 +117,12 @@ class PlannerSkeleton:
         self.final_eval_logged = False
         self.planning_fail_reason = None
         self.blocked_grid_cache = None
+        self.line_penalty_grid_cache = None
         self.parking_reverse_ticks = 0
         self.parking_reverse_cooldown = 0
+        self.parking_has_reversed = False
         self.rl_speed = RLSpeedController(enabled=USE_RL_SPEED_CONTROL)
+        self._warm_planning_caches()
         print(f"[algo] rl_speed_control={'ON' if USE_RL_SPEED_CONTROL else 'OFF'}")
 
     def compute_path(self, obs: Dict[str, Any]) -> None:
@@ -124,6 +130,9 @@ class PlannerSkeleton:
 
         self.waypoints.clear()
         self.waypoint_index = 0
+        self.parking_reverse_ticks = 0
+        self.parking_reverse_cooldown = 0
+        self.parking_has_reversed = False
         state = obs.get("state", {})
         start = (
             float(state.get("x", 0.0)),
@@ -148,12 +157,9 @@ class PlannerSkeleton:
 
         if best_plan is None:
             self.planning_fail_reason = "all_approach_candidates_failed"
-            print("[algo] planning fallback: A* failed, using straight dogleg approach path")
+            print("[algo] planning fallback: A* failed, using direct approach path")
             approach_pose = candidates[0]
-            grid_path = self._fallback_approach_path(
-                (start[0], start[1]),
-                (approach_pose[0], approach_pose[1]),
-            )
+            grid_path = [(start[0], start[1]), (approach_pose[0], approach_pose[1])]
         else:
             self.planning_fail_reason = None
             approach_pose, grid_path, cost = best_plan
@@ -164,8 +170,7 @@ class PlannerSkeleton:
                 f" a_star_points={len(grid_path)} cost={cost:.2f}"
             )
 
-        straightened = self._straighten_approach_path(grid_path)
-        simplified = self._simplify_path(straightened, spacing=1.0)
+        simplified = self._simplify_path(grid_path, spacing=1.0)
         points = self._append_final_alignment(simplified, target_pose)
         self.waypoints = self._points_to_waypoints(points, final_yaw=target_pose[2], gear="D")
 
@@ -244,20 +249,54 @@ class PlannerSkeleton:
         gear = target_wp[3]
         in_parking_mode = final_dist < PARKING_ALIGN_DISTANCE
         reverse_realigning = False
+        forward_clearance = self._estimate_forward_clearance(
+            x=x,
+            y=y,
+            yaw=yaw,
+            reverse=False,
+        )
+        target_overshot = self._passed_target_center(
+            x=x,
+            y=y,
+            target_center=target_center,
+            target_yaw=final_wp[2],
+            tolerance=max(center_tolerance, PARKING_TARGET_OVERSHOOT),
+        )
         if self.parking_reverse_cooldown > 0:
             self.parking_reverse_cooldown -= 1
+        should_reverse_for_alignment = (
+            not self.parking_has_reversed
+            and final_yaw_error > PARKING_REVERSE_YAW_ERROR
+        )
+        should_reverse_for_obstacle = forward_clearance < PARKING_REVERSE_WALL_CLEARANCE
+        should_reverse_after_forward = self.parking_has_reversed and (
+            should_reverse_for_obstacle or target_overshot
+        )
         if (
             in_parking_mode
             and self.parking_reverse_ticks <= 0
-            and self.parking_reverse_cooldown <= 0
-            and final_yaw_error > PARKING_REVERSE_YAW_ERROR
+            and (self.parking_reverse_cooldown <= 0 or should_reverse_after_forward)
+            and (
+                should_reverse_for_alignment
+                or should_reverse_for_obstacle
+                or should_reverse_after_forward
+            )
             and final_dist > max(center_tolerance * 1.8, 0.35)
         ):
             self.parking_reverse_ticks = PARKING_REVERSE_TICKS
+            self.parking_has_reversed = True
+            reverse_reason = (
+                "alignment"
+                if should_reverse_for_alignment
+                else "front_obstacle" if should_reverse_for_obstacle else "target_overshoot"
+            )
             print(
                 "[algo] parking recovery: reverse realignment"
                 f" pos_error={final_dist:.2f}m"
                 f" yaw_error={math.degrees(final_yaw_error):.1f}deg"
+                f" reason={reverse_reason}"
+                f" forward_clearance={forward_clearance:.2f}m"
+                f" target_overshot={target_overshot}"
             )
         if in_parking_mode and self.parking_reverse_ticks > 0:
             self.parking_reverse_ticks -= 1
@@ -383,6 +422,19 @@ class PlannerSkeleton:
             and float(slot[2]) - margin <= y <= float(slot[3]) + margin
         )
 
+    def _passed_target_center(
+        self,
+        x: float,
+        y: float,
+        target_center: Tuple[float, float],
+        target_yaw: float,
+        tolerance: float,
+    ) -> bool:
+        dx = x - target_center[0]
+        dy = y - target_center[1]
+        along_target_axis = dx * math.cos(target_yaw) + dy * math.sin(target_yaw)
+        return along_target_axis > tolerance
+
     def _approach_pose(self, slot: List[float], target_yaw: float) -> Tuple[float, float, float]:
         cx, cy = self._slot_center(slot)
         above = (cx, cy + 3.0, target_yaw)
@@ -485,10 +537,11 @@ class PlannerSkeleton:
         if self.map_extent is None:
             return []
         xmin, xmax, ymin, ymax = self.map_extent
-        grid_step = max(self.cell_size, 0.5)
+        grid_step = max(self.cell_size, 0.75)
         cols = max(1, int(math.ceil((xmax - xmin) / grid_step)))
         rows = max(1, int(math.ceil((ymax - ymin) / grid_step)))
         blocked = self._cached_blocked_grid(rows, cols, grid_step)
+        line_penalties = self._cached_line_penalty_grid(rows, cols, grid_step)
 
         def to_cell(point: Tuple[float, float]) -> Tuple[int, int]:
             px, py = point
@@ -525,7 +578,7 @@ class PlannerSkeleton:
         cost_so_far: Dict[Tuple[int, int, int], float] = {start_state: 0.0}
         goal_state: Optional[Tuple[int, int, int]] = None
         expansions = 0
-        max_expansions = max(2500, rows * cols * 2)
+        max_expansions = max(2500, rows * cols * 4)
 
         while open_heap:
             _, _, current = heapq.heappop(open_heap)
@@ -544,11 +597,18 @@ class PlannerSkeleton:
                 if blocked[nxt[0]][nxt[1]]:
                     continue
                 move_cost = math.hypot(dr, dc)
-                turn_penalty = APPROACH_TURN_PENALTY * abs(turn)
+                turn_penalty = 0.55 * abs(turn)
                 heading_penalty = 0.0
                 if goal_heading is not None:
-                    heading_penalty = 0.10 * self._heading_index_distance(next_heading, goal_heading)
-                new_cost = cost_so_far[current] + move_cost + turn_penalty + heading_penalty
+                    heading_penalty = 0.05 * self._heading_index_distance(next_heading, goal_heading)
+                clearance_penalty = line_penalties[nxt[0]][nxt[1]]
+                new_cost = (
+                    cost_so_far[current]
+                    + move_cost
+                    + turn_penalty
+                    + heading_penalty
+                    + clearance_penalty
+                )
                 if new_cost >= cost_so_far.get(nxt, float("inf")):
                     continue
                 cost_so_far[nxt] = new_cost
@@ -580,6 +640,16 @@ class PlannerSkeleton:
             return True
         return self._heading_index_distance(heading, goal_heading) <= 1
 
+    def _warm_planning_caches(self) -> None:
+        if self.map_extent is None:
+            return
+        xmin, xmax, ymin, ymax = self.map_extent
+        grid_step = max(self.cell_size, 0.75)
+        cols = max(1, int(math.ceil((xmax - xmin) / grid_step)))
+        rows = max(1, int(math.ceil((ymax - ymin) / grid_step)))
+        self._cached_blocked_grid(rows, cols, grid_step)
+        self._cached_line_penalty_grid(rows, cols, grid_step)
+
     def _cached_blocked_grid(self, rows: int, cols: int, grid_step: float) -> List[List[bool]]:
         if (
             self.blocked_grid_cache is None
@@ -590,6 +660,55 @@ class PlannerSkeleton:
             base = self._build_blocked_grid(rows, cols, grid_step)
             self.blocked_grid_cache = (rows, cols, grid_step, base)
         return [row[:] for row in self.blocked_grid_cache[3]]
+
+    def _cached_line_penalty_grid(self, rows: int, cols: int, grid_step: float) -> List[List[float]]:
+        if (
+            self.line_penalty_grid_cache is None
+            or self.line_penalty_grid_cache[0] != rows
+            or self.line_penalty_grid_cache[1] != cols
+            or abs(self.line_penalty_grid_cache[2] - grid_step) > 1e-9
+        ):
+            penalties = self._build_line_penalty_grid(rows, cols, grid_step)
+            self.line_penalty_grid_cache = (rows, cols, grid_step, penalties)
+        return self.line_penalty_grid_cache[3]
+
+    def _build_line_penalty_grid(self, rows: int, cols: int, grid_step: float) -> List[List[float]]:
+        penalties = [[0.0 for _ in range(cols)] for _ in range(rows)]
+        if self.map_extent is None:
+            return penalties
+        line_rects = self._line_obstacle_rects(half_width=0.08)
+        if not line_rects:
+            return penalties
+        margin = PLANNING_OBSTACLE_MARGIN + LINE_EXTRA_CLEARANCE
+        for rect in line_rects:
+            self._mark_penalty_rect(penalties, rect, grid_step, margin=margin, penalty=2.0)
+        return penalties
+
+    def _mark_penalty_rect(
+        self,
+        penalties: List[List[float]],
+        rect: Tuple[float, float, float, float],
+        grid_step: float,
+        margin: float,
+        penalty: float,
+    ) -> None:
+        if self.map_extent is None:
+            return
+        xmin, _, _, ymax = self.map_extent
+        rows = len(penalties)
+        cols = len(penalties[0]) if rows else 0
+        rx0, rx1, ry0, ry1 = rect
+        rx0 -= margin
+        rx1 += margin
+        ry0 -= margin
+        ry1 += margin
+        c0 = max(0, int((rx0 - xmin) / grid_step))
+        c1 = min(cols - 1, int((rx1 - xmin) / grid_step))
+        r0 = max(0, int((ymax - ry1) / grid_step))
+        r1 = min(rows - 1, int((ymax - ry0) / grid_step))
+        for row in range(r0, r1 + 1):
+            for col in range(c0, c1 + 1):
+                penalties[row][col] = max(penalties[row][col], penalty)
 
     def _build_blocked_grid(self, rows: int, cols: int, grid_step: float) -> List[List[bool]]:
         blocked = [[False for _ in range(cols)] for _ in range(rows)]
@@ -717,83 +836,6 @@ class PlannerSkeleton:
                 last = point
         simplified.append(path[-1])
         return simplified
-
-    def _straighten_approach_path(
-        self,
-        path: List[Tuple[float, float]],
-    ) -> List[Tuple[float, float]]:
-        if len(path) <= 2:
-            return path
-        smoothed = [path[0]]
-        idx = 0
-        while idx < len(path) - 1:
-            next_idx = len(path) - 1
-            while next_idx > idx + 1:
-                if self._segment_is_clear(path[idx], path[next_idx]):
-                    break
-                next_idx -= 1
-            smoothed.append(path[next_idx])
-            idx = next_idx
-        return smoothed
-
-    def _segment_is_clear(
-        self,
-        start: Tuple[float, float],
-        end: Tuple[float, float],
-        clearance: float = APPROACH_STRAIGHT_CLEARANCE,
-    ) -> bool:
-        distance = math.hypot(end[0] - start[0], end[1] - start[1])
-        steps = max(2, int(distance / 0.35))
-        for step in range(1, steps):
-            ratio = step / steps
-            x = start[0] + (end[0] - start[0]) * ratio
-            y = start[1] + (end[1] - start[1]) * ratio
-            if not self._inside_map(x, y, margin=0.2):
-                return False
-            if self._estimate_clearance((x, y), include_lines=True) < clearance:
-                return False
-        return True
-
-    def _fallback_approach_path(
-        self,
-        start: Tuple[float, float],
-        approach: Tuple[float, float],
-    ) -> List[Tuple[float, float]]:
-        if self.map_extent is None:
-            return [start, approach]
-        xmin, xmax, ymin, ymax = self.map_extent
-        margin = VEHICLE_CENTER_CLEARANCE + 0.35
-        sx, sy = start
-        ax, ay = approach
-        direction = 1.0 if ay >= sy else -1.0
-
-        y_candidates: List[float] = []
-        step = 2.0
-        count = int((ymax - ymin) / step)
-        for idx in range(count + 1):
-            y = ymin + idx * step
-            if ymin + margin <= y <= ymax - margin:
-                y_candidates.append(y)
-        y_candidates.sort(key=lambda y: (abs(y - ay), -direction * (y - sy)))
-
-        for mid_y in y_candidates:
-            if direction * (mid_y - sy) < 0.0:
-                continue
-            first = (sx, mid_y)
-            second = (ax, mid_y)
-            if not self._inside_map(first[0], first[1], margin=0.2):
-                continue
-            if not self._inside_map(second[0], second[1], margin=0.2):
-                continue
-            if not self._segment_is_clear(start, first):
-                continue
-            if not self._segment_is_clear(first, second):
-                continue
-            if not self._segment_is_clear(second, approach, clearance=0.05):
-                continue
-            return [start, first, second, approach]
-
-        return [start, approach]
 
     def _points_to_waypoints(
         self,
@@ -930,6 +972,13 @@ class PlannerSkeleton:
             math.hypot(path[i][0] - path[i - 1][0], path[i][1] - path[i - 1][1])
             for i in range(1, len(path))
         )
+
+    def _line_margin_penalty(self, point: Tuple[float, float]) -> float:
+        clearance = self._estimate_clearance(point, include_lines=True)
+        if clearance >= LINE_EXTRA_CLEARANCE:
+            return 0.0
+        shortage = LINE_EXTRA_CLEARANCE - clearance
+        return 4.0 * shortage / max(LINE_EXTRA_CLEARANCE, 1e-6)
 
     def _speed_command(
         self,
