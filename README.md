@@ -16,6 +16,7 @@ The planner keeps the existing A* style structure but shapes the search for park
 - Use a local terminal Hybrid A* over `(x, y, yaw, gear)` to produce curved waypoints.
 - Add a start stabilizer waypoint so the vehicle does not immediately cut into the first parking-line edge.
 - Use asynchronous planning in Pygame mode to avoid IPC timeout.
+- Cache planning geometry and use a distance prefilter before polygon collision checks to reduce waypoint search time.
 
 Core cost form:
 
@@ -64,6 +65,15 @@ S = S_preview + 0.025 C_grid - bonus_semantic + penalty_fallback
 
 So the final selected path is not just the shortest path. It is the path that is short enough, collision-free in preview, aligned with the target pose, and reasonably smooth for the controller to follow.
 
+5. Runtime optimization keeps the same planner structure but avoids repeated geometry work:
+
+```text
+cache: occupied slots / wall rects / line rects / guided A* blocked grid
+prefilter: skip polygon intersection if rect is farther than the vehicle bounding radius
+```
+
+This reduces the slow terminal Hybrid A* collision-check loop without changing the simulator collision rules.
+
 ## Implementation Sketch
 
 ```python
@@ -86,9 +96,11 @@ def compute_path(obs):
 Latest checked cases:
 
 ```text
-default_lot map_seed=821958799 target_idx=6  success, score=72.31, IoU=0.3000, collision=-
-default_lot seed=101                         success, score=71.38, IoU=0.3002, collision=-
+default_lot seed=101                         success, score=77.27, IoU=0.3002, collision=-
+default_lot map_seed=821958799 target_idx=6  success, score=79.23, IoU=0.3002, collision=-
+default_lot seed=202                         success, score=74.94, IoU=0.3001, collision=-
 ```
 
-It is still not a proof that every random seed is collision-free; remaining work is broader seed tuning.
-Timeout should also be checked on more seeds because the planner still uses grid A*.
+Pygame IPC check: first command returned in about `0.014s`; background planning for the hard target-6 case finished in about `2.1s`.
+
+Known limitation: `training_course seed=707` still times out without collision in the current planner-only version. More tuning is needed for rear-in / dense-lot cases.

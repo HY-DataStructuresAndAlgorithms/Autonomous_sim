@@ -59,13 +59,15 @@ PARKING_REVERSE_WALL_CLEARANCE = 0.85
 PARKING_TARGET_OVERSHOOT = 0.30
 LINE_EXTRA_CLEARANCE = PLANNING_OBSTACLE_MARGIN * 0.20
 GUIDED_LINE_FOOTPRINT_MARGIN = 1.20
+GUIDED_GRID_STEP_MIN = 0.75
+GUIDED_CANDIDATE_EVAL_LIMIT = 2
 TERMINAL_XY_RESOLUTION = 1.0
 TERMINAL_YAW_RESOLUTION = math.radians(30.0)
 TERMINAL_PRIMITIVE_LENGTH = 1.5
 TERMINAL_PRIMITIVE_STEPS = 6
-TERMINAL_MAX_ITERATIONS = 4500
-GEAR_TRANSITION_RADIUS = 0.85
-GEAR_TRANSITION_YAW_TOLERANCE = math.radians(22.0)
+TERMINAL_MAX_ITERATIONS = 3600
+GEAR_TRANSITION_RADIUS = 1.25
+GEAR_TRANSITION_YAW_TOLERANCE = math.radians(45.0)
 SEMANTIC_ENTRY_BONUS = 3.0
 FALLBACK_ENTRY_PENALTY = 4.0
 PREVIEW_MAX_TIME = 22.0
@@ -122,6 +124,10 @@ class PlannerSkeleton:
     planning_fail_reason: Optional[str] = None
     blocked_grid_cache: Optional[Tuple[int, int, float, List[List[bool]]]] = None
     line_penalty_grid_cache: Optional[Tuple[int, int, float, List[List[float]]]] = None
+    guided_blocked_grid_cache: Optional[Tuple[int, int, float, List[List[bool]]]] = None
+    obstacle_rect_cache: Optional[List[Tuple[float, float, float, float]]] = None
+    line_rect_cache: Optional[Dict[float, List[Tuple[float, float, float, float]]]] = None
+    collision_rect_cache: Optional[List[Tuple[float, float, float, float]]] = None
     parking_reverse_ticks: int = 0
     parking_reverse_cooldown: int = 0
     parking_has_reversed: bool = False
@@ -159,6 +165,10 @@ class PlannerSkeleton:
         self.planning_fail_reason = None
         self.blocked_grid_cache = None
         self.line_penalty_grid_cache = None
+        self.guided_blocked_grid_cache = None
+        self.obstacle_rect_cache = None
+        self.line_rect_cache = None
+        self.collision_rect_cache = None
         self.parking_reverse_ticks = 0
         self.parking_reverse_cooldown = 0
         self.parking_has_reversed = False
@@ -560,7 +570,19 @@ class PlannerSkeleton:
             steer_abs=abs(steer),
             obstacle_dist=obstacle_dist,
         )
-        accel, brake = self._speed_command(speed=speed, target_speed=target_speed)
+        front_is_clear = obstacle_dist > 1.5 and final_dist > 4.0
+        force_full_accel = (
+            gear == "D"
+            and front_is_clear
+            and final_dist > 10.0
+            and abs(steer) < math.radians(8.0)
+        )
+        accel, brake = self._speed_command(
+            speed=speed,
+            target_speed=target_speed,
+            front_is_clear=front_is_clear,
+            force_full_accel=force_full_accel,
+        )
         self._log_evaluation(
             parking_success=False,
             fail_reason="collision_risk" if collision_risk else self.planning_fail_reason or "running",
@@ -590,13 +612,13 @@ class PlannerSkeleton:
 
     def _guided_lookahead(self, speed: float, final_dist: float, yaw_error: float) -> float:
         if self.waypoint_index >= self.hybrid_start_index:
-            return 0.65 if final_dist < 3.0 else 0.95
+            return 0.72 if final_dist < 2.0 else 1.10
         if final_dist > 18.0:
-            return 2.8
+            return 3.25
         if final_dist > 8.0:
-            return 2.2
+            return 2.65
         if final_dist > 3.0:
-            return 1.6
+            return 1.85
         return 0.9
 
     def _guided_lookahead_index(self, x: float, y: float, lookahead: float) -> int:
@@ -618,21 +640,28 @@ class PlannerSkeleton:
         steer: float,
         obstacle_dist: float,
     ) -> float:
-        target = 1.65
-        if final_dist < 8.0:
-            target = 0.95
-        if final_dist < 3.0:
-            target = 0.36
+        target = min(2.65, 1.65 + 0.035 * final_dist)
+        if final_dist < 10.0:
+            target = min(target, 1.35)
+        if final_dist < 4.0:
+            target = min(target, 0.82)
+        if final_dist < 1.6:
+            target = min(target, 0.28)
         if abs(steer) > math.radians(27.0):
-            target = min(target, 0.75)
+            target = min(target, 0.95)
         if obstacle_dist < 1.2:
-            target = min(target, 0.75)
+            target = min(target, 1.25 if final_dist > 8.0 else 0.85)
         if obstacle_dist < 0.55:
-            target = min(target, 0.35)
+            if final_dist > 8.0:
+                target = min(target, 1.05)
+            elif final_dist > 3.0:
+                target = min(target, 0.70)
+            else:
+                target = min(target, 0.35)
         if self.waypoint_index >= self.hybrid_start_index:
-            target = min(target, 0.52)
-            if final_dist < 3.0:
-                target = min(target, 0.30)
+            target = min(target, 0.72)
+            if final_dist < 1.4:
+                target = min(target, 0.24)
         return target
 
     def _target_pose(self, slot: List[float]) -> Tuple[float, float, float]:
@@ -908,7 +937,7 @@ class PlannerSkeleton:
             return dist + 0.4 * final_leg + 3.0 * ray + 0.8 * lateral + 0.8 / max(clearance, 0.25)
 
         best: Optional[Tuple[Tuple[float, float, float], List[Tuple[float, float]], float]] = None
-        for candidate in sorted(candidates, key=rough)[:3]:
+        for candidate in sorted(candidates, key=rough)[:GUIDED_CANDIDATE_EVAL_LIMIT]:
             grid_path = self._guided_astar_path(start_xy, (candidate[0], candidate[1]))
             if not grid_path:
                 continue
@@ -1019,10 +1048,10 @@ class PlannerSkeleton:
         if self.map_extent is None:
             return []
         xmin, xmax, ymin, ymax = self.map_extent
-        grid_step = max(self.cell_size, 0.75)
+        grid_step = max(self.cell_size, GUIDED_GRID_STEP_MIN)
         cols = max(1, int(math.ceil((xmax - xmin) / grid_step)))
         rows = max(1, int(math.ceil((ymax - ymin) / grid_step)))
-        blocked = self._guided_blocked_grid(rows, cols, grid_step)
+        blocked = self._cached_guided_blocked_grid(rows, cols, grid_step)
 
         def to_cell(point: Tuple[float, float]) -> Tuple[int, int]:
             px, py = point
@@ -1079,6 +1108,17 @@ class PlannerSkeleton:
         path.extend(to_world(cell) for cell in cells[1:-1])
         path.append(goal_xy)
         return path
+
+    def _cached_guided_blocked_grid(self, rows: int, cols: int, grid_step: float) -> List[List[bool]]:
+        if (
+            self.guided_blocked_grid_cache is None
+            or self.guided_blocked_grid_cache[0] != rows
+            or self.guided_blocked_grid_cache[1] != cols
+            or abs(self.guided_blocked_grid_cache[2] - grid_step) > 1e-9
+        ):
+            base = self._guided_blocked_grid(rows, cols, grid_step)
+            self.guided_blocked_grid_cache = (rows, cols, grid_step, base)
+        return [row[:] for row in self.guided_blocked_grid_cache[3]]
 
     def _guided_blocked_grid(self, rows: int, cols: int, grid_step: float) -> List[List[bool]]:
         blocked = [[False for _ in range(cols)] for _ in range(rows)]
@@ -1664,8 +1704,14 @@ class PlannerSkeleton:
         car_poly = self._car_polygon(x, y, yaw)
         if self._rect_contains_poly(target_slot, car_poly):
             return False
-        rects = self._obstacle_rects() + self._line_obstacle_rects(half_width=0.25)
-        for rect in rects:
+        reject_radius = math.hypot(0.5 * VEHICLE_LONGEST_LENGTH, 0.85) + 0.10
+        reject_radius_sq = reject_radius * reject_radius
+        for rect in self._collision_rects():
+            rx0, rx1, ry0, ry1 = rect
+            dx = max(rx0 - x, 0.0, x - rx1)
+            dy = max(ry0 - y, 0.0, y - ry1)
+            if dx * dx + dy * dy > reject_radius_sq:
+                continue
             if self._poly_intersects_rect(car_poly, rect):
                 return True
         return False
@@ -1845,11 +1891,12 @@ class PlannerSkeleton:
         if self.map_extent is None:
             return
         xmin, xmax, ymin, ymax = self.map_extent
-        grid_step = max(self.cell_size, 0.75)
+        grid_step = max(self.cell_size, GUIDED_GRID_STEP_MIN)
         cols = max(1, int(math.ceil((xmax - xmin) / grid_step)))
         rows = max(1, int(math.ceil((ymax - ymin) / grid_step)))
         self._cached_blocked_grid(rows, cols, grid_step)
         self._cached_line_penalty_grid(rows, cols, grid_step)
+        self._cached_guided_blocked_grid(rows, cols, grid_step)
 
     def _cached_blocked_grid(self, rows: int, cols: int, grid_step: float) -> List[List[bool]]:
         if (
@@ -1926,9 +1973,17 @@ class PlannerSkeleton:
         # Keep the baseline explainable: hard-block occupied slots and walls.
         return self._inflate_blocked(blocked, radius_cells=0)
 
+    def _collision_rects(self) -> List[Tuple[float, float, float, float]]:
+        if self.collision_rect_cache is None:
+            self.collision_rect_cache = self._obstacle_rects() + self._line_obstacle_rects(half_width=0.25)
+        return self.collision_rect_cache
+
     def _obstacle_rects(self) -> List[Tuple[float, float, float, float]]:
+        if self.obstacle_rect_cache is not None:
+            return self.obstacle_rect_cache
         rects: List[Tuple[float, float, float, float]] = []
         if not self.map_data:
+            self.obstacle_rect_cache = rects
             return rects
         slots = self.map_data.get("slots") or []
         occupied = self.map_data.get("occupied_idx") or []
@@ -1937,11 +1992,18 @@ class PlannerSkeleton:
                 rects.append(tuple(float(v) for v in slot))
         for rect in self.map_data.get("walls_rects") or []:
             rects.append(tuple(float(v) for v in rect))
+        self.obstacle_rect_cache = rects
         return rects
 
     def _line_obstacle_rects(self, half_width: float) -> List[Tuple[float, float, float, float]]:
+        key = round(float(half_width), 4)
+        if self.line_rect_cache is None:
+            self.line_rect_cache = {}
+        if key in self.line_rect_cache:
+            return self.line_rect_cache[key]
         rects: List[Tuple[float, float, float, float]] = []
         if not self.map_data or self.map_extent is None:
+            self.line_rect_cache[key] = rects
             return rects
         xmin, xmax, ymin, ymax = self.map_extent
         for line in self.map_data.get("lines") or []:
@@ -1969,6 +2031,7 @@ class PlannerSkeleton:
             ry1 = min(ry1, ymax)
             if rx1 > rx0 and ry1 > ry0:
                 rects.append((rx0, rx1, ry0, ry1))
+        self.line_rect_cache[key] = rects
         return rects
 
     def _mark_rect(
