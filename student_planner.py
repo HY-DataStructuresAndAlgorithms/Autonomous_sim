@@ -734,11 +734,8 @@ class PlannerSkeleton:
 
         for rect in self._obstacle_rects():
             self._mark_rect(blocked, rect, grid_step, margin=PLANNING_OBSTACLE_MARGIN)
-        for rect in self._line_obstacle_rects(half_width=0.08):
-            self._mark_rect(blocked, rect, grid_step, margin=PLANNING_OBSTACLE_MARGIN)
-        # The stationary grid is useful for later scoring/cost tuning, but as a
-        # hard obstacle it closes many center-line A* corridors in this map.
-        # Keep the baseline explainable: hard-block occupied slots and walls.
+        # Lines are soft planning penalties, not hard obstacles. Hard-block
+        # occupied slots and walls only so A* can still enter parking slots.
         return self._inflate_blocked(blocked, radius_cells=0)
 
     def _obstacle_rects(self) -> List[Tuple[float, float, float, float]]:
