@@ -470,7 +470,7 @@ class PlannerSkeleton:
     def _slot_center_tolerance(self, slot: List[float]) -> float:
         slot_w = abs(float(slot[1]) - float(slot[0]))
         slot_l = abs(float(slot[3]) - float(slot[2]))
-        return max(0.20, 0.10 * min(slot_w, slot_l))
+        return max(0.15, 0.05 * min(slot_w, slot_l))
 
     def _point_in_slot(self, slot: List[float], x: float, y: float, margin: float = 0.0) -> bool:
         return (
