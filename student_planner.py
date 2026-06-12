@@ -20,7 +20,6 @@ from __future__ import annotations
 import heapq
 import json
 import math
-import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -29,12 +28,7 @@ from rl_speed_controller import RLSpeedController
 
 
 Waypoint = Tuple[float, float, float, str]  # x, y, desired yaw, gear
-USE_RL_SPEED_CONTROL = os.getenv("PARKING_USE_RL_SPEED", "1").lower() not in {
-    "0",
-    "false",
-    "off",
-    "no",
-}
+USE_RL_SPEED_CONTROL = False
 VEHICLE_LONGEST_LENGTH = 3.0
 VEHICLE_BOUNDARY_DIAMETER = VEHICLE_LONGEST_LENGTH * 1.20
 VEHICLE_CENTER_CLEARANCE = 0.5 * VEHICLE_BOUNDARY_DIAMETER
