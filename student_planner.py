@@ -43,6 +43,8 @@ PARKING_REVERSE_YAW_ERROR = math.radians(32.0)
 PARKING_REVERSE_TICKS = 58
 PARKING_REVERSE_COOLDOWN_TICKS = 45
 PARKING_REVERSE_WALL_CLEARANCE = 0.85
+PARKING_REVERSE_REARM_CLEARANCE = 0.65
+PARKING_REVERSE_REARM_DISTANCE = 0.90
 PARKING_TARGET_OVERSHOOT = 0.30
 LINE_EXTRA_CLEARANCE = PLANNING_OBSTACLE_MARGIN * 0.20
 
@@ -84,6 +86,8 @@ class PlannerSkeleton:
     parking_reverse_ticks: int = 0
     parking_reverse_cooldown: int = 0
     parking_has_reversed: bool = False
+    parking_reverse_completed: bool = False
+    parking_last_reverse_end: Optional[Tuple[float, float]] = None
 
     def __post_init__(self) -> None:
         if self.waypoints is None:
@@ -115,6 +119,8 @@ class PlannerSkeleton:
         self.parking_reverse_ticks = 0
         self.parking_reverse_cooldown = 0
         self.parking_has_reversed = False
+        self.parking_reverse_completed = False
+        self.parking_last_reverse_end = None
         self.rl_speed = RLSpeedController(enabled=USE_RL_SPEED_CONTROL)
         self._warm_planning_caches()
         print(f"[algo] rl_speed_control={'ON' if USE_RL_SPEED_CONTROL else 'OFF'}")
@@ -127,6 +133,8 @@ class PlannerSkeleton:
         self.parking_reverse_ticks = 0
         self.parking_reverse_cooldown = 0
         self.parking_has_reversed = False
+        self.parking_reverse_completed = False
+        self.parking_last_reverse_end = None
         state = obs.get("state", {})
         start = (
             float(state.get("x", 0.0)),
@@ -261,9 +269,20 @@ class PlannerSkeleton:
             not self.parking_has_reversed
             and final_yaw_error > PARKING_REVERSE_YAW_ERROR
         )
-        should_reverse_for_obstacle = forward_clearance < PARKING_REVERSE_WALL_CLEARANCE
-        should_reverse_after_forward = self.parking_has_reversed and (
-            should_reverse_for_obstacle or target_overshot
+        forward_after_reverse = 0.0
+        if self.parking_last_reverse_end is not None:
+            forward_after_reverse = math.hypot(
+                x - self.parking_last_reverse_end[0],
+                y - self.parking_last_reverse_end[1],
+            )
+        should_reverse_for_obstacle = (
+            not self.parking_has_reversed
+            and forward_clearance < PARKING_REVERSE_WALL_CLEARANCE
+        )
+        should_reverse_after_forward = (
+            self.parking_reverse_completed
+            and forward_after_reverse >= PARKING_REVERSE_REARM_DISTANCE
+            and forward_clearance < PARKING_REVERSE_REARM_CLEARANCE
         )
         if (
             in_parking_mode
@@ -281,7 +300,7 @@ class PlannerSkeleton:
             reverse_reason = (
                 "alignment"
                 if should_reverse_for_alignment
-                else "front_obstacle" if should_reverse_for_obstacle else "target_overshoot"
+                else "front_obstacle" if should_reverse_for_obstacle else "forward_until_collision_risk"
             )
             print(
                 "[algo] parking recovery: reverse realignment"
@@ -289,12 +308,15 @@ class PlannerSkeleton:
                 f" yaw_error={math.degrees(final_yaw_error):.1f}deg"
                 f" reason={reverse_reason}"
                 f" forward_clearance={forward_clearance:.2f}m"
+                f" forward_after_reverse={forward_after_reverse:.2f}m"
                 f" target_overshot={target_overshot}"
             )
         if in_parking_mode and self.parking_reverse_ticks > 0:
             self.parking_reverse_ticks -= 1
             if self.parking_reverse_ticks <= 0:
                 self.parking_reverse_cooldown = PARKING_REVERSE_COOLDOWN_TICKS
+                self.parking_reverse_completed = True
+                self.parking_last_reverse_end = (x, y)
             target_wp = self._parking_reverse_target(target_center, final_wp[2])
             gear = "R"
             reverse_realigning = True
