@@ -571,8 +571,8 @@ class PlannerSkeleton:
 
         start = to_cell(start_xy)
         goal = to_cell(goal_xy)
-        self._clear_cell(blocked, start, radius=3)
-        self._clear_cell(blocked, goal, radius=4)
+        self._clear_cell(blocked, start, radius=0, grid_step=grid_step)
+        self._clear_cell(blocked, goal, radius=0, grid_step=grid_step)
 
         heading_moves = [
             (0, 1, 0.0),       # east
@@ -827,15 +827,33 @@ class PlannerSkeleton:
                             inflated[rr][cc] = True
         return inflated
 
-    def _clear_cell(self, blocked: List[List[bool]], cell: Tuple[int, int], radius: int) -> None:
+    def _clear_cell(
+        self,
+        blocked: List[List[bool]],
+        cell: Tuple[int, int],
+        radius: int,
+        grid_step: float,
+    ) -> None:
         rows = len(blocked)
         cols = len(blocked[0]) if rows else 0
         for dr in range(-radius, radius + 1):
             for dc in range(-radius, radius + 1):
                 rr = cell[0] + dr
                 cc = cell[1] + dc
-                if 0 <= rr < rows and 0 <= cc < cols:
+                if 0 <= rr < rows and 0 <= cc < cols and not self._cell_hits_wall(rr, cc, grid_step):
                     blocked[rr][cc] = False
+
+    def _cell_hits_wall(self, row: int, col: int, grid_step: float) -> bool:
+        if self.map_extent is None or not self.map_data:
+            return False
+        xmin, _, _, ymax = self.map_extent
+        x = xmin + (col + 0.5) * grid_step
+        y = ymax - (row + 0.5) * grid_step
+        for rect in self.map_data.get("walls_rects") or []:
+            rx0, rx1, ry0, ry1 = (float(v) for v in rect)
+            if rx0 <= x <= rx1 and ry0 <= y <= ry1:
+                return True
+        return False
 
     def _simplify_path(
         self,
