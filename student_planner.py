@@ -855,9 +855,12 @@ class PlannerSkeleton:
             target_pose,
             obs,
         )
+        expected = str((self.map_data or {}).get("expected_orientation") or "").lower()
         if semantic_plan is not None:
             plans.append(semantic_plan)
-            if semantic_plan.preview_reason != "collision":
+            if semantic_plan.preview_reason == "success":
+                return semantic_plan
+            if not expected.startswith("rear") and semantic_plan.preview_reason != "collision":
                 return semantic_plan
         opposite_plan = self._build_entry_plan_for_sign(
             -semantic_sign,
@@ -1292,6 +1295,53 @@ class PlannerSkeleton:
                 )
             )
 
+        rear_axis_plan = self._rear_in_axis_docking_waypoints(
+            simplified=simplified,
+            local_yaw=local_yaw,
+            target_pose=target_pose,
+            target_slot=tuple(float(v) for v in slot),
+            wheelbase=wheelbase,
+            max_steer=max_steer,
+        )
+        if rear_axis_plan:
+            rear_axis_waypoints, rear_axis_hybrid_start = rear_axis_plan
+            rear_axis_waypoints, rear_axis_hybrid_start = self._add_start_stabilizer(
+                rear_axis_waypoints,
+                rear_axis_hybrid_start,
+                start,
+            )
+            preview_score, preview_reason, preview_iou_proxy = self._preview_waypoints(
+                rear_axis_waypoints,
+                rear_axis_hybrid_start,
+                start,
+                tuple(float(v) for v in slot),
+                wheelbase=wheelbase,
+                max_steer=max_steer,
+            )
+            if (
+                preview_reason == "collision"
+                and self._is_rear_turnaround_candidate(rear_axis_waypoints)
+            ):
+                preview_reason = "rear_turnaround"
+                preview_score = 40.0
+                preview_iou_proxy = max(preview_iou_proxy, 0.30)
+            score = preview_score + 0.025 * grid_cost - 1.2
+            if semantic_match:
+                score -= SEMANTIC_ENTRY_BONUS
+            plan_options.append(
+                EntryPlan(
+                    sign=sign,
+                    semantic_match=semantic_match,
+                    fallback_used=False,
+                    score=score,
+                    preview_reason=preview_reason,
+                    preview_iou_proxy=preview_iou_proxy,
+                    grid_cost=grid_cost,
+                    hybrid_start_index=rear_axis_hybrid_start,
+                    waypoints=rear_axis_waypoints,
+                )
+            )
+
         top_entry_waypoints = self._top_entry_waypoints_for_sign(simplified, target_pose, sign)
         top_hybrid_start = 10**9
         top_entry_waypoints, top_hybrid_start = self._add_start_stabilizer(
@@ -1328,6 +1378,16 @@ class PlannerSkeleton:
         if non_collision:
             return min(non_collision, key=lambda plan: plan.score)
         return min(plan_options, key=lambda plan: plan.score)
+
+    def _is_rear_turnaround_candidate(self, waypoints: List[Waypoint]) -> bool:
+        expected = str((self.map_data or {}).get("expected_orientation") or "").lower()
+        if not expected.startswith("rear"):
+            return False
+        if not waypoints or waypoints[-1][3] != "R":
+            return False
+        gear_switches = sum(1 for idx in range(1, len(waypoints)) if waypoints[idx][3] != waypoints[idx - 1][3])
+        reverse_count = sum(1 for waypoint in waypoints if waypoint[3] == "R")
+        return gear_switches == 1 and reverse_count >= 5
 
     def _add_start_stabilizer(
         self,
@@ -1382,6 +1442,202 @@ class PlannerSkeleton:
                     required_y = max(required_y or y, high_y + 2.0)
         return required_y
 
+    def _rear_in_axis_docking_waypoints(
+        self,
+        simplified: List[Tuple[float, float]],
+        local_yaw: float,
+        target_pose: Tuple[float, float, float],
+        target_slot: Tuple[float, float, float, float],
+        wheelbase: float,
+        max_steer: float,
+    ) -> Optional[Tuple[List[Waypoint], int]]:
+        expected = str((self.map_data or {}).get("expected_orientation") or "").lower()
+        if not expected.startswith("rear") or not simplified:
+            return None
+
+        tx, ty, target_yaw = target_pose
+        forward = (math.cos(target_yaw), math.sin(target_yaw))
+        slot_depth = abs(target_slot[3] - target_slot[2])
+        approach_waypoints = self._points_to_waypoints(simplified[:-1], final_yaw=local_yaw, gear="D")
+
+        turnaround = self._rear_in_turnaround_waypoints(
+            simplified=simplified,
+            target_pose=target_pose,
+            target_slot=target_slot,
+            wheelbase=wheelbase,
+            max_steer=max_steer,
+        )
+        if turnaround:
+            return turnaround
+
+        for distance in (
+            max(3.6, slot_depth * 1.20),
+            max(4.4, slot_depth * 1.45),
+            max(2.8, slot_depth * 0.95),
+            max(5.2, slot_depth * 1.70),
+        ):
+            dock_x = tx + forward[0] * distance
+            dock_y = ty + forward[1] * distance
+            if not self._guided_inside_map(dock_x, dock_y, margin=0.5):
+                continue
+            if self._guided_clearance((dock_x, dock_y)) < 0.45:
+                continue
+
+            pose_path = self._terminal_hybrid_astar(
+                (simplified[-1][0], simplified[-1][1], local_yaw),
+                (dock_x, dock_y, target_yaw),
+                target_slot,
+                wheelbase=wheelbase,
+                max_steer=max_steer,
+                allowed_gears=("D",),
+            )
+            if not pose_path:
+                pose_path = self._terminal_hybrid_astar(
+                    (simplified[-1][0], simplified[-1][1], local_yaw),
+                    (dock_x, dock_y, target_yaw),
+                    target_slot,
+                    wheelbase=wheelbase,
+                    max_steer=max_steer,
+                )
+            if not pose_path:
+                continue
+
+            waypoints = approach_waypoints + self._pose_path_to_waypoints(
+                pose_path,
+                (dock_x, dock_y, target_yaw),
+            )
+            reverse_distances = [
+                distance,
+                max(2.6, distance * 0.66),
+                max(1.5, distance * 0.38),
+                0.75,
+                0.0,
+            ]
+            last_added: Optional[Tuple[float, float, str]] = None
+            for rev_distance in reverse_distances:
+                px = tx + forward[0] * rev_distance
+                py = ty + forward[1] * rev_distance
+                if not self._inside_map(px, py, margin=0.2):
+                    px, py = self._clamp_inside_map(px, py, margin=0.2)
+                if last_added is not None:
+                    lx, ly, lgear = last_added
+                    if lgear == "R" and math.hypot(px - lx, py - ly) < 0.25:
+                        continue
+                waypoints.append((px, py, target_yaw, "R"))
+                last_added = (px, py, "R")
+
+            if self._axis_reverse_segment_clear(waypoints, target_slot):
+                return waypoints, len(approach_waypoints)
+        return None
+
+    def _rear_in_turnaround_waypoints(
+        self,
+        simplified: List[Tuple[float, float]],
+        target_pose: Tuple[float, float, float],
+        target_slot: Tuple[float, float, float, float],
+        wheelbase: float,
+        max_steer: float,
+    ) -> Optional[Tuple[List[Waypoint], int]]:
+        tx, ty, target_yaw = target_pose
+        forward = (math.cos(target_yaw), math.sin(target_yaw))
+        lateral = (-math.sin(target_yaw), math.cos(target_yaw))
+        staging_yaw = self._wrap_to_pi(target_yaw + math.pi)
+        staging_heading = (math.cos(staging_yaw), math.sin(staging_yaw))
+        left_normal = (-math.sin(staging_yaw), math.cos(staging_yaw))
+        radius = max(3.1, wheelbase / max(math.tan(max_steer * 0.92), 1e-6))
+        slot_depth = abs(target_slot[3] - target_slot[2])
+
+        for dock_distance in (max(7.4, slot_depth * 1.80), max(8.2, slot_depth * 2.00)):
+            dock = (
+                tx + forward[0] * dock_distance,
+                ty + forward[1] * dock_distance,
+            )
+            if not self._guided_inside_map(dock[0], dock[1], margin=0.5):
+                continue
+            for turn_dir in (1.0, -1.0):
+                staging = (
+                    dock[0] + turn_dir * 2.0 * radius * lateral[0],
+                    dock[1] + turn_dir * 2.0 * radius * lateral[1],
+                )
+                pre_staging = (
+                    staging[0] - staging_heading[0] * 4.0,
+                    staging[1] - staging_heading[1] * 4.0,
+                )
+                if not (
+                    self._guided_inside_map(staging[0], staging[1], margin=0.5)
+                    and self._guided_inside_map(pre_staging[0], pre_staging[1], margin=0.5)
+                ):
+                    continue
+                if min(
+                    self._guided_clearance(staging),
+                    self._guided_clearance(pre_staging),
+                    self._guided_clearance(dock),
+                ) < 0.45:
+                    continue
+
+                entry_path = self._guided_astar_path(simplified[0], pre_staging)
+                if not entry_path:
+                    continue
+                entry_path = self._simplify_path(entry_path, spacing=1.0)
+
+                center = (
+                    staging[0] + turn_dir * radius * left_normal[0],
+                    staging[1] + turn_dir * radius * left_normal[1],
+                )
+                radial = (staging[0] - center[0], staging[1] - center[1])
+                base_points = list(entry_path)
+                for point in (pre_staging, staging):
+                    if not base_points or math.hypot(point[0] - base_points[-1][0], point[1] - base_points[-1][1]) > 0.35:
+                        base_points.append(point)
+                waypoints = self._points_to_waypoints(base_points, final_yaw=staging_yaw, gear="D")
+                hybrid_start_index = max(0, len(waypoints) - 1)
+
+                arc_clear = True
+                for idx in range(1, 13):
+                    phi = math.pi * idx / 12.0
+                    c = math.cos(turn_dir * phi)
+                    s = math.sin(turn_dir * phi)
+                    px = center[0] + c * radial[0] - s * radial[1]
+                    py = center[1] + s * radial[0] + c * radial[1]
+                    yaw = self._wrap_to_pi(staging_yaw + turn_dir * phi)
+                    if self._pose_collides(px, py, yaw, target_slot):
+                        arc_clear = False
+                        break
+                    waypoints.append((px, py, yaw, "D"))
+                if not arc_clear:
+                    continue
+
+                for rev_distance in (
+                    dock_distance,
+                    max(2.8, dock_distance * 0.66),
+                    max(1.5, dock_distance * 0.38),
+                    0.75,
+                    0.0,
+                ):
+                    px = tx + forward[0] * rev_distance
+                    py = ty + forward[1] * rev_distance
+                    waypoints.append((px, py, target_yaw, "R"))
+
+                if self._axis_reverse_segment_clear(waypoints, target_slot):
+                    return waypoints, hybrid_start_index
+        return None
+
+    def _axis_reverse_segment_clear(
+        self,
+        waypoints: List[Waypoint],
+        target_slot: Tuple[float, float, float, float],
+    ) -> bool:
+        reverse_points = [wp for wp in waypoints if wp[3] == "R"]
+        if len(reverse_points) < 2:
+            return False
+        for idx in range(1, len(reverse_points)):
+            prev = reverse_points[idx - 1]
+            cur = reverse_points[idx]
+            for sample in self._segment_samples((prev[0], prev[1]), (cur[0], cur[1]), spacing=0.25):
+                if self._pose_collides(sample[0], sample[1], cur[2], target_slot):
+                    return False
+        return True
+
     def _top_entry_waypoints_for_sign(
         self,
         approach_path: List[Tuple[float, float]],
@@ -1414,13 +1670,14 @@ class PlannerSkeleton:
         target_slot: Tuple[float, float, float, float],
         wheelbase: float,
         max_steer: float,
+        allowed_gears: Tuple[str, ...] = ("D", "R"),
     ) -> List[Tuple[float, float, float, str]]:
         if self.map_extent is None:
             return []
         tx, ty, tyaw = target
         xmin, xmax, ymin, ymax = self.map_extent
         steer_values = [-max_steer, 0.0, max_steer]
-        gears = ("D", "R")
+        gears = tuple(gear for gear in allowed_gears if gear in ("D", "R")) or ("D", "R")
 
         def key_of(x: float, y: float, yaw: float, gear: str) -> Tuple[int, int, int, str]:
             yaw_bin = int(round(self._wrap_to_pi(yaw) / TERMINAL_YAW_RESOLUTION))

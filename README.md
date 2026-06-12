@@ -14,6 +14,7 @@ The planner keeps the existing A* style structure but shapes the search for park
 - Use obstacle and parking-line distance as risk cost.
 - Select entry direction using slot-line semantics, but also evaluate the opposite side when needed.
 - Use a local terminal Hybrid A* over `(x, y, yaw, gear)` to produce curved waypoints.
+- For rear-in parking, add a planner-only U-turn staging candidate: drive to an aisle staging pose, make one forward U-turn, then reverse along the slot centerline.
 - Add a start stabilizer waypoint so the vehicle does not immediately cut into the first parking-line edge.
 - Use asynchronous planning in Pygame mode to avoid IPC timeout.
 - Cache planning geometry, use a spatial index, and apply a distance prefilter before polygon collision checks to reduce waypoint search time.
@@ -57,7 +58,17 @@ theta' = theta + ds / L * tan(delta)
 
 Here `delta` is sampled from left / straight / right steering values, and `gear` is sampled from drive / reverse. This is why the terminal trajectory can contain curved motion rather than only straight line segments.
 
-4. Each full candidate path is previewed with the same kinematic update used by the controller-side tracking approximation. Candidates that collide receive a large penalty; successful candidates are ranked by time, distance, steering flips, gear switches, and grid cost:
+4. Rear-in parking gets one extra terminal candidate that does not modify the controller. The planner first searches to a staging pose in the aisle, samples a forward U-turn using the bicycle geometry, and then appends a straight reverse docking segment:
+
+```text
+R_min = L / tan(delta_max)
+theta' = theta + ds / L * tan(delta)
+reverse axis: (x, y) = (x_g, y_g) + r [cos(theta_g), sin(theta_g)]
+```
+
+This was added because direct terminal Hybrid A* could create small D/R/D/R loops near the slot. The staged candidate gives the existing pure-pursuit tracker a simpler `D -> R` path.
+
+5. Each full candidate path is previewed with the same kinematic update used by the controller-side tracking approximation. Candidates are ranked by time, distance, steering flips, gear switches, grid cost, and semantic entry:
 
 ```text
 S = S_preview + 0.025 C_grid - bonus_semantic + penalty_fallback
@@ -65,7 +76,7 @@ S = S_preview + 0.025 C_grid - bonus_semantic + penalty_fallback
 
 So the final selected path is not just the shortest path. It is the path that is short enough, collision-free in preview, aligned with the target pose, and reasonably smooth for the controller to follow.
 
-5. Runtime optimization keeps the same planner structure but avoids repeated geometry work:
+6. Runtime optimization keeps the same planner structure but avoids repeated geometry work:
 
 ```text
 cache: occupied slots / wall rects / line rects / guided A* blocked grid
@@ -88,6 +99,10 @@ def compute_path(obs):
         terminal_path = hybrid_astar(global_path[-1], target_pose)
         candidates.append(preview_and_score(global_path + terminal_path))
 
+    if expected_orientation == "rear_in":
+        staging_path = risk_aware_grid_astar(start, rear_in_staging_pose(target_pose))
+        candidates.append(score(staging_path + forward_u_turn() + reverse_axis_dock()))
+
     waypoints = min(candidates, key=lambda c: c.score).waypoints
     return waypoints
 ```
@@ -97,11 +112,17 @@ def compute_path(obs):
 Latest checked cases:
 
 ```text
+training_course seed=707                    success, score=84.45, IoU=0.3001, orientation=rear_in
 default_lot seed=101                         success, score=77.27, IoU=0.3002, collision=-
 default_lot map_seed=821958799 target_idx=6  success, score=79.23, IoU=0.3002, collision=-
 default_lot seed=202                         success, score=74.94, IoU=0.3001, collision=-
 ```
 
-Pygame IPC check: first command returned in about `0.007s`; background planning for the hard target-6 case finished in about `0.81s`.
+Small local seed sweep after the rear-in staging change:
 
-Known limitation: `training_course seed=707` still times out without collision in the current planner-only version. A terminal loop guard now brakes and holds instead of letting the vehicle keep circling (`terminal_loop_hold`), but rear-in / dense-lot success still needs a better terminal planner or controller.
+```text
+default_lot:      6/6 success, avg score 76.11
+training_course:  2/8 success, avg score 21.24
+```
+
+Known limitation: the rear-in staged path solves the observed loop case (`training_course seed=707`) without touching the controller, but it is not yet a full general rear-in solver for every random target. The next planner-side improvement would be generating multiple staging lanes/turn radii and selecting them with simulator-aligned collision checks.
