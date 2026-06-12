@@ -1295,6 +1295,43 @@ class PlannerSkeleton:
                 )
             )
 
+        open_axis_plan = self._rear_in_open_side_axis_waypoints(
+            simplified=simplified,
+            target_pose=target_pose,
+            target_slot=tuple(float(v) for v in slot),
+        )
+        if open_axis_plan:
+            open_axis_waypoints, open_axis_hybrid_start = open_axis_plan
+            open_axis_waypoints, open_axis_hybrid_start = self._add_start_stabilizer(
+                open_axis_waypoints,
+                open_axis_hybrid_start,
+                start,
+            )
+            preview_score, preview_reason, preview_iou_proxy = self._preview_waypoints(
+                open_axis_waypoints,
+                open_axis_hybrid_start,
+                start,
+                tuple(float(v) for v in slot),
+                wheelbase=wheelbase,
+                max_steer=max_steer,
+            )
+            score = preview_score + 0.025 * grid_cost - 1.6
+            if semantic_match:
+                score -= SEMANTIC_ENTRY_BONUS
+            plan_options.append(
+                EntryPlan(
+                    sign=sign,
+                    semantic_match=semantic_match,
+                    fallback_used=False,
+                    score=score,
+                    preview_reason=preview_reason,
+                    preview_iou_proxy=preview_iou_proxy,
+                    grid_cost=grid_cost,
+                    hybrid_start_index=open_axis_hybrid_start,
+                    waypoints=open_axis_waypoints,
+                )
+            )
+
         rear_axis_plan = self._rear_in_axis_docking_waypoints(
             simplified=simplified,
             local_yaw=local_yaw,
@@ -1318,13 +1355,11 @@ class PlannerSkeleton:
                 wheelbase=wheelbase,
                 max_steer=max_steer,
             )
-            if (
-                preview_reason == "collision"
-                and self._is_rear_turnaround_candidate(rear_axis_waypoints)
-            ):
-                preview_reason = "rear_turnaround"
-                preview_score = 40.0
-                preview_iou_proxy = max(preview_iou_proxy, 0.30)
+            if self._is_rear_turnaround_candidate(rear_axis_waypoints):
+                if preview_reason in {"collision", "timeout"}:
+                    preview_reason = "rear_turnaround"
+                    preview_score = 40.0
+                    preview_iou_proxy = max(preview_iou_proxy, 0.30)
             score = preview_score + 0.025 * grid_cost - 1.2
             if semantic_match:
                 score -= SEMANTIC_ENTRY_BONUS
@@ -1441,6 +1476,84 @@ class PlannerSkeleton:
                 if x + 2.0 <= line_x <= x + 9.0 and low_y - 1.0 <= y <= high_y + 1.0:
                     required_y = max(required_y or y, high_y + 2.0)
         return required_y
+
+    def _rear_in_open_side_axis_waypoints(
+        self,
+        simplified: List[Tuple[float, float]],
+        target_pose: Tuple[float, float, float],
+        target_slot: Tuple[float, float, float, float],
+    ) -> Optional[Tuple[List[Waypoint], int]]:
+        expected = str((self.map_data or {}).get("expected_orientation") or "").lower()
+        if not expected.startswith("rear") or not simplified:
+            return None
+
+        tx, ty, target_yaw = target_pose
+        if self.map_extent is not None:
+            _xmin, _xmax, ymin, ymax = self.map_extent
+            slot_cy = 0.5 * (target_slot[2] + target_slot[3])
+            if not (ymin + 12.0 <= slot_cy <= ymax - 12.0):
+                return None
+        forward = (math.cos(target_yaw), math.sin(target_yaw))
+        open_y_sign = self._open_side_y_sign(list(target_slot))
+        if open_y_sign * math.sin(target_yaw) >= 0.0:
+            return None
+
+        slot_depth = abs(target_slot[3] - target_slot[2])
+        for staging_distance in (
+            max(7.0, slot_depth * 1.70),
+            max(6.0, slot_depth * 1.45),
+            max(5.0, slot_depth * 1.20),
+        ):
+            staging = (
+                tx - forward[0] * staging_distance,
+                ty - forward[1] * staging_distance,
+            )
+            pre_staging = (
+                staging[0] - forward[0] * 2.2,
+                staging[1] - forward[1] * 2.2,
+            )
+            if not (
+                self._guided_inside_map(staging[0], staging[1], margin=0.5)
+                and self._guided_inside_map(pre_staging[0], pre_staging[1], margin=0.5)
+            ):
+                continue
+            if min(self._guided_clearance(staging), self._guided_clearance(pre_staging)) < 0.45:
+                continue
+            entry_path = self._guided_astar_path(simplified[0], pre_staging)
+            if not entry_path:
+                continue
+            entry_path = self._simplify_path(entry_path, spacing=1.0)
+            waypoints = self._points_to_waypoints(entry_path, final_yaw=target_yaw, gear="D")
+            hybrid_start_index = max(0, len(waypoints) - 1)
+            for distance in (
+                staging_distance,
+                max(2.8, staging_distance * 0.65),
+                max(1.6, staging_distance * 0.38),
+                0.75,
+                0.0,
+            ):
+                px = tx - forward[0] * distance
+                py = ty - forward[1] * distance
+                if not waypoints or math.hypot(px - waypoints[-1][0], py - waypoints[-1][1]) > 0.25:
+                    waypoints.append((px, py, target_yaw, "D"))
+            if self._axis_drive_segment_clear(waypoints[hybrid_start_index:], target_slot):
+                return waypoints, hybrid_start_index
+        return None
+
+    def _axis_drive_segment_clear(
+        self,
+        waypoints: List[Waypoint],
+        target_slot: Tuple[float, float, float, float],
+    ) -> bool:
+        if len(waypoints) < 2:
+            return False
+        for idx in range(1, len(waypoints)):
+            prev = waypoints[idx - 1]
+            cur = waypoints[idx]
+            for sample in self._segment_samples((prev[0], prev[1]), (cur[0], cur[1]), spacing=0.25):
+                if self._pose_collides(sample[0], sample[1], cur[2], target_slot):
+                    return False
+        return True
 
     def _rear_in_axis_docking_waypoints(
         self,
@@ -1559,67 +1672,67 @@ class PlannerSkeleton:
                     dock[0] + turn_dir * 2.0 * radius * lateral[0],
                     dock[1] + turn_dir * 2.0 * radius * lateral[1],
                 )
-                pre_staging = (
-                    staging[0] - staging_heading[0] * 4.0,
-                    staging[1] - staging_heading[1] * 4.0,
-                )
-                if not (
-                    self._guided_inside_map(staging[0], staging[1], margin=0.5)
-                    and self._guided_inside_map(pre_staging[0], pre_staging[1], margin=0.5)
-                ):
+                if not self._guided_inside_map(staging[0], staging[1], margin=0.5):
                     continue
-                if min(
-                    self._guided_clearance(staging),
-                    self._guided_clearance(pre_staging),
-                    self._guided_clearance(dock),
-                ) < 0.45:
-                    continue
+                for pre_distance in (4.0, 3.4, 2.8, 2.2):
+                    pre_staging = (
+                        staging[0] - staging_heading[0] * pre_distance,
+                        staging[1] - staging_heading[1] * pre_distance,
+                    )
+                    if not self._guided_inside_map(pre_staging[0], pre_staging[1], margin=0.5):
+                        continue
+                    if min(
+                        self._guided_clearance(staging),
+                        self._guided_clearance(pre_staging),
+                        self._guided_clearance(dock),
+                    ) < 0.45:
+                        continue
 
-                entry_path = self._guided_astar_path(simplified[0], pre_staging)
-                if not entry_path:
-                    continue
-                entry_path = self._simplify_path(entry_path, spacing=1.0)
+                    entry_path = self._guided_astar_path(simplified[0], pre_staging)
+                    if not entry_path:
+                        continue
+                    entry_path = self._simplify_path(entry_path, spacing=1.0)
 
-                center = (
-                    staging[0] + turn_dir * radius * left_normal[0],
-                    staging[1] + turn_dir * radius * left_normal[1],
-                )
-                radial = (staging[0] - center[0], staging[1] - center[1])
-                base_points = list(entry_path)
-                for point in (pre_staging, staging):
-                    if not base_points or math.hypot(point[0] - base_points[-1][0], point[1] - base_points[-1][1]) > 0.35:
-                        base_points.append(point)
-                waypoints = self._points_to_waypoints(base_points, final_yaw=staging_yaw, gear="D")
-                hybrid_start_index = max(0, len(waypoints) - 1)
+                    center = (
+                        staging[0] + turn_dir * radius * left_normal[0],
+                        staging[1] + turn_dir * radius * left_normal[1],
+                    )
+                    radial = (staging[0] - center[0], staging[1] - center[1])
+                    base_points = list(entry_path)
+                    for point in (pre_staging, staging):
+                        if not base_points or math.hypot(point[0] - base_points[-1][0], point[1] - base_points[-1][1]) > 0.35:
+                            base_points.append(point)
+                    waypoints = self._points_to_waypoints(base_points, final_yaw=staging_yaw, gear="D")
+                    hybrid_start_index = max(0, len(waypoints) - 1)
 
-                arc_clear = True
-                for idx in range(1, 13):
-                    phi = math.pi * idx / 12.0
-                    c = math.cos(turn_dir * phi)
-                    s = math.sin(turn_dir * phi)
-                    px = center[0] + c * radial[0] - s * radial[1]
-                    py = center[1] + s * radial[0] + c * radial[1]
-                    yaw = self._wrap_to_pi(staging_yaw + turn_dir * phi)
-                    if self._pose_collides(px, py, yaw, target_slot):
-                        arc_clear = False
-                        break
-                    waypoints.append((px, py, yaw, "D"))
-                if not arc_clear:
-                    continue
+                    arc_clear = True
+                    for idx in range(1, 13):
+                        phi = math.pi * idx / 12.0
+                        c = math.cos(turn_dir * phi)
+                        s = math.sin(turn_dir * phi)
+                        px = center[0] + c * radial[0] - s * radial[1]
+                        py = center[1] + s * radial[0] + c * radial[1]
+                        yaw = self._wrap_to_pi(staging_yaw + turn_dir * phi)
+                        if self._pose_collides(px, py, yaw, target_slot):
+                            arc_clear = False
+                            break
+                        waypoints.append((px, py, yaw, "D"))
+                    if not arc_clear:
+                        continue
 
-                for rev_distance in (
-                    dock_distance,
-                    max(2.8, dock_distance * 0.66),
-                    max(1.5, dock_distance * 0.38),
-                    0.75,
-                    0.0,
-                ):
-                    px = tx + forward[0] * rev_distance
-                    py = ty + forward[1] * rev_distance
-                    waypoints.append((px, py, target_yaw, "R"))
+                    for rev_distance in (
+                        dock_distance,
+                        max(2.8, dock_distance * 0.66),
+                        max(1.5, dock_distance * 0.38),
+                        0.75,
+                        0.0,
+                    ):
+                        px = tx + forward[0] * rev_distance
+                        py = ty + forward[1] * rev_distance
+                        waypoints.append((px, py, target_yaw, "R"))
 
-                if self._axis_reverse_segment_clear(waypoints, target_slot):
-                    return waypoints, hybrid_start_index
+                    if self._axis_reverse_segment_clear(waypoints, target_slot):
+                        return waypoints, hybrid_start_index
         return None
 
     def _axis_reverse_segment_clear(

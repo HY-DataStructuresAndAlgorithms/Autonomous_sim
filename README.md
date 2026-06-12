@@ -15,6 +15,7 @@ The planner keeps the existing A* style structure but shapes the search for park
 - Select entry direction using slot-line semantics, but also evaluate the opposite side when needed.
 - Use a local terminal Hybrid A* over `(x, y, yaw, gear)` to produce curved waypoints.
 - For rear-in parking, add a planner-only U-turn staging candidate: drive to an aisle staging pose, make one forward U-turn, then reverse along the slot centerline.
+- For middle-row rear-in slots, add an open-side axis entry candidate so the path enters through the open parking side instead of crossing the lower parking line.
 - Add a start stabilizer waypoint so the vehicle does not immediately cut into the first parking-line edge.
 - Use asynchronous planning in Pygame mode to avoid IPC timeout.
 - Cache planning geometry, use a spatial index, and apply a distance prefilter before polygon collision checks to reduce waypoint search time.
@@ -121,8 +122,8 @@ default_lot seed=202                         success, score=74.94, IoU=0.3001, c
 Small local seed sweep after the rear-in staging change:
 
 ```text
-default_lot:      6/6 success, avg score 76.11
-training_course:  2/8 success, avg score 21.24
+default_lot:      6/6 success, avg score 76.11, line collisions 0
+training_course:  5/8 success, avg score 52.84, line collisions 0
 ```
 
-Known limitation: the rear-in staged path solves the observed loop case (`training_course seed=707`) without touching the controller, but it is not yet a full general rear-in solver for every random target. The next planner-side improvement would be generating multiple staging lanes/turn radii and selecting them with simulator-aligned collision checks.
+Known limitation: the rear-in staged path solves the observed loop/line-collision cases without touching the controller, but it is not yet a full general rear-in solver for every random target. Remaining training-course failures are terminal hold cases for middle-row slots and one occupied-slot collision, so the next planner-side improvement would be generating multiple staging lanes/turn radii and selecting them with simulator-aligned collision checks.
