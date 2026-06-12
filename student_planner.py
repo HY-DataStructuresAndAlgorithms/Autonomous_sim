@@ -47,6 +47,7 @@ PARKING_REVERSE_REARM_CLEARANCE = 0.65
 PARKING_REVERSE_REARM_DISTANCE = 0.90
 PARKING_TARGET_OVERSHOOT = 0.30
 LINE_EXTRA_CLEARANCE = PLANNING_OBSTACLE_MARGIN * 0.20
+A_STAR_MAX_HEADING_STEP = 1  # 8-heading grid: one step means at most 45 degrees.
 
 
 def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
@@ -603,7 +604,7 @@ class PlannerSkeleton:
                 break
             if expansions > max_expansions:
                 break
-            for turn in (-1, 0, 1):
+            for turn in range(-A_STAR_MAX_HEADING_STEP, A_STAR_MAX_HEADING_STEP + 1):
                 next_heading = (current[2] + turn) % len(heading_moves)
                 dr, dc, _ = heading_moves[next_heading]
                 nxt = (current[0] + dr, current[1] + dc, next_heading)
