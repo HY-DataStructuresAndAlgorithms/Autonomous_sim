@@ -157,9 +157,8 @@ class PlannerSkeleton:
 
         if best_plan is None:
             self.planning_fail_reason = "all_approach_candidates_failed"
-            print("[algo] planning fallback: A* failed, using direct approach path")
-            approach_pose = candidates[0]
-            grid_path = [(start[0], start[1]), (approach_pose[0], approach_pose[1])]
+            print("[algo] planning failed: A* failed, no fallback path will be used")
+            return
         else:
             self.planning_fail_reason = None
             approach_pose, grid_path, cost = best_plan
