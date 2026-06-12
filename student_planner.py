@@ -48,6 +48,8 @@ PARKING_ALIGN_DISTANCE = 4.0
 PARKING_REVERSE_YAW_ERROR = math.radians(32.0)
 PARKING_REVERSE_TICKS = 58
 PARKING_REVERSE_COOLDOWN_TICKS = 45
+APPROACH_TURN_PENALTY = 2.35
+APPROACH_STRAIGHT_CLEARANCE = 0.35
 
 
 def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
@@ -146,9 +148,12 @@ class PlannerSkeleton:
 
         if best_plan is None:
             self.planning_fail_reason = "all_approach_candidates_failed"
-            print("[algo] planning fallback: A* failed, using direct approach path")
+            print("[algo] planning fallback: A* failed, using straight dogleg approach path")
             approach_pose = candidates[0]
-            grid_path = [(start[0], start[1]), (approach_pose[0], approach_pose[1])]
+            grid_path = self._fallback_approach_path(
+                (start[0], start[1]),
+                (approach_pose[0], approach_pose[1]),
+            )
         else:
             self.planning_fail_reason = None
             approach_pose, grid_path, cost = best_plan
@@ -159,7 +164,8 @@ class PlannerSkeleton:
                 f" a_star_points={len(grid_path)} cost={cost:.2f}"
             )
 
-        simplified = self._simplify_path(grid_path, spacing=1.0)
+        straightened = self._straighten_approach_path(grid_path)
+        simplified = self._simplify_path(straightened, spacing=1.0)
         points = self._append_final_alignment(simplified, target_pose)
         self.waypoints = self._points_to_waypoints(points, final_yaw=target_pose[2], gear="D")
 
@@ -538,10 +544,10 @@ class PlannerSkeleton:
                 if blocked[nxt[0]][nxt[1]]:
                     continue
                 move_cost = math.hypot(dr, dc)
-                turn_penalty = 0.55 * abs(turn)
+                turn_penalty = APPROACH_TURN_PENALTY * abs(turn)
                 heading_penalty = 0.0
                 if goal_heading is not None:
-                    heading_penalty = 0.05 * self._heading_index_distance(next_heading, goal_heading)
+                    heading_penalty = 0.10 * self._heading_index_distance(next_heading, goal_heading)
                 new_cost = cost_so_far[current] + move_cost + turn_penalty + heading_penalty
                 if new_cost >= cost_so_far.get(nxt, float("inf")):
                     continue
@@ -711,6 +717,83 @@ class PlannerSkeleton:
                 last = point
         simplified.append(path[-1])
         return simplified
+
+    def _straighten_approach_path(
+        self,
+        path: List[Tuple[float, float]],
+    ) -> List[Tuple[float, float]]:
+        if len(path) <= 2:
+            return path
+        smoothed = [path[0]]
+        idx = 0
+        while idx < len(path) - 1:
+            next_idx = len(path) - 1
+            while next_idx > idx + 1:
+                if self._segment_is_clear(path[idx], path[next_idx]):
+                    break
+                next_idx -= 1
+            smoothed.append(path[next_idx])
+            idx = next_idx
+        return smoothed
+
+    def _segment_is_clear(
+        self,
+        start: Tuple[float, float],
+        end: Tuple[float, float],
+        clearance: float = APPROACH_STRAIGHT_CLEARANCE,
+    ) -> bool:
+        distance = math.hypot(end[0] - start[0], end[1] - start[1])
+        steps = max(2, int(distance / 0.35))
+        for step in range(1, steps):
+            ratio = step / steps
+            x = start[0] + (end[0] - start[0]) * ratio
+            y = start[1] + (end[1] - start[1]) * ratio
+            if not self._inside_map(x, y, margin=0.2):
+                return False
+            if self._estimate_clearance((x, y), include_lines=True) < clearance:
+                return False
+        return True
+
+    def _fallback_approach_path(
+        self,
+        start: Tuple[float, float],
+        approach: Tuple[float, float],
+    ) -> List[Tuple[float, float]]:
+        if self.map_extent is None:
+            return [start, approach]
+        xmin, xmax, ymin, ymax = self.map_extent
+        margin = VEHICLE_CENTER_CLEARANCE + 0.35
+        sx, sy = start
+        ax, ay = approach
+        direction = 1.0 if ay >= sy else -1.0
+
+        y_candidates: List[float] = []
+        step = 2.0
+        count = int((ymax - ymin) / step)
+        for idx in range(count + 1):
+            y = ymin + idx * step
+            if ymin + margin <= y <= ymax - margin:
+                y_candidates.append(y)
+        y_candidates.sort(key=lambda y: (abs(y - ay), -direction * (y - sy)))
+
+        for mid_y in y_candidates:
+            if direction * (mid_y - sy) < 0.0:
+                continue
+            first = (sx, mid_y)
+            second = (ax, mid_y)
+            if not self._inside_map(first[0], first[1], margin=0.2):
+                continue
+            if not self._inside_map(second[0], second[1], margin=0.2):
+                continue
+            if not self._segment_is_clear(start, first):
+                continue
+            if not self._segment_is_clear(first, second):
+                continue
+            if not self._segment_is_clear(second, approach, clearance=0.05):
+                continue
+            return [start, first, second, approach]
+
+        return [start, approach]
 
     def _points_to_waypoints(
         self,
