@@ -47,6 +47,10 @@ FRONT_APPROACH_DISTANCE = 5.0
 REAR_APPROACH_DISTANCE = 8.0
 FINAL_ALIGNMENT_DISTANCES = (3.4, 2.4, 1.45, 0.75, 0.35, 0.0)
 FINAL_ALIGN_CLEARANCE_MIN = 0.10
+PARKING_ENTRY_DISTANCES = (4.0, 3.5, 3.0, 2.5)
+PARKING_CENTERLINE_DISTANCES = (2.4, 1.2, 0.35, 0.0)
+PARKING_LATERAL_OFFSETS = (0.0, -0.4, 0.4)
+PARKING_CANDIDATE_MARGIN = 0.18
 APPROACH_TARGET_TOLERANCE = 0.30
 PARKING_SEGMENT_TRIGGER_DISTANCE = 4.00
 APPROACH_CRUISE_SPEED = 5.30
@@ -353,7 +357,7 @@ class PlannerSkeleton:
         lookahead = self._adaptive_lookahead(speed, final_dist, control_yaw_error)
         target_idx = self._lookahead_index(x, y, lookahead=lookahead)
         target_wp = self.waypoints[target_idx]
-        gear = target_wp[3]
+        gear = self._segment_gear_for_target(target_idx)
         reverse_realigning = False
         forward_clearance = self._estimate_forward_clearance(
             x=x,
@@ -422,7 +426,7 @@ class PlannerSkeleton:
             in_parking_mode
             and self.parking_state in (PARKING_STATE_ALIGN_CHECK, PARKING_STATE_FORWARD_ALIGN)
             and (not self.parking_has_reversed or should_reverse_after_forward)
-            and target_wp[3] != "R"
+            and gear != "R"
             and final_dist > max(center_tolerance * 1.8, 0.35)
             and (
                 should_reverse_for_alignment
@@ -1021,12 +1025,12 @@ class PlannerSkeleton:
         if not near_approach and not near_target:
             return
 
-        points = self._append_final_alignment([(x, y)], target_pose)
-        if not near_approach and not self._alignment_path_is_clear(points):
-            # Straight-line entry would cut through an obstacle and the
-            # planned approach point has not been reached yet; keep
-            # following the A* path and retry once closer.
+        selected = self._select_parking_segment(x, y, target_pose)
+        if selected is None:
+            # Parking entry candidates would collide or leave the map; keep
+            # following the A* approach path and retry from a better pose.
             return
+        points, segment_cost = selected
 
         self.waypoints = self._points_to_waypoints(
             points,
@@ -1046,12 +1050,18 @@ class PlannerSkeleton:
         self.parking_reverse_start = None
         print(
             "[algo] parking segment ready:"
+            f" mode={self.parking_mode}"
             f" waypoints={len(self.waypoints)}"
+            f" cost={segment_cost:.2f}"
             f" target=({target_pose[0]:.2f}, {target_pose[1]:.2f}, "
             f"yaw={math.degrees(target_pose[2]):.1f}deg)"
         )
 
-    def _alignment_path_is_clear(self, points: List[Tuple[float, float]]) -> bool:
+    def _alignment_path_is_clear(
+        self,
+        points: List[Tuple[float, float]],
+        vehicle_margin: float = PARKING_CANDIDATE_MARGIN,
+    ) -> bool:
         step = 0.5
         for idx in range(len(points) - 1):
             x0, y0 = points[idx]
@@ -1070,10 +1080,149 @@ class PlannerSkeleton:
                     py,
                     yaw,
                     include_lines=True,
-                    vehicle_margin=PARKING_VEHICLE_RECT_MARGIN,
+                    vehicle_margin=vehicle_margin,
                 ) <= 0.0:
                     return False
         return True
+
+    def _select_parking_segment(
+        self,
+        x: float,
+        y: float,
+        target_pose: Tuple[float, float, float],
+    ) -> Optional[Tuple[List[Tuple[float, float]], float]]:
+        best: Optional[Tuple[List[Tuple[float, float]], float]] = None
+        for lateral_offset in PARKING_LATERAL_OFFSETS:
+            for entry_distance in PARKING_ENTRY_DISTANCES:
+                points = self._build_parking_segment_points(
+                    x=x,
+                    y=y,
+                    target_pose=target_pose,
+                    entry_distance=entry_distance,
+                    lateral_offset=lateral_offset,
+                )
+                score = self._score_parking_segment(
+                    points=points,
+                    target_pose=target_pose,
+                    entry_distance=entry_distance,
+                    lateral_offset=lateral_offset,
+                )
+                if score is None:
+                    continue
+                if best is None or score < best[1]:
+                    best = (points, score)
+        return best
+
+    def _build_parking_segment_points(
+        self,
+        x: float,
+        y: float,
+        target_pose: Tuple[float, float, float],
+        entry_distance: float,
+        lateral_offset: float,
+    ) -> List[Tuple[float, float]]:
+        tx, ty, target_yaw = target_pose
+        axis_x = math.cos(target_yaw)
+        axis_y = math.sin(target_yaw)
+        lateral_x = -axis_y
+        lateral_y = axis_x
+        entry_sign = 1.0 if self._is_rear_parking_mode() else -1.0
+        points: List[Tuple[float, float]] = [(x, y)]
+
+        entry_point = (
+            tx + entry_sign * axis_x * entry_distance + lateral_x * lateral_offset,
+            ty + entry_sign * axis_y * entry_distance + lateral_y * lateral_offset,
+        )
+        self._append_unique_point(points, entry_point)
+
+        if abs(lateral_offset) > 0.05:
+            centerline_point = (
+                tx + entry_sign * axis_x * entry_distance,
+                ty + entry_sign * axis_y * entry_distance,
+            )
+            self._append_unique_point(points, centerline_point)
+
+        for distance in PARKING_CENTERLINE_DISTANCES:
+            if distance >= entry_distance - 0.20:
+                continue
+            point = (
+                tx + entry_sign * axis_x * distance,
+                ty + entry_sign * axis_y * distance,
+            )
+            self._append_unique_point(points, point)
+        return points
+
+    def _append_unique_point(
+        self,
+        points: List[Tuple[float, float]],
+        point: Tuple[float, float],
+    ) -> None:
+        if math.hypot(point[0] - points[-1][0], point[1] - points[-1][1]) > 0.25:
+            points.append(point)
+
+    def _score_parking_segment(
+        self,
+        points: List[Tuple[float, float]],
+        target_pose: Tuple[float, float, float],
+        entry_distance: float,
+        lateral_offset: float,
+    ) -> Optional[float]:
+        if len(points) < 2:
+            return None
+        if not self._alignment_path_is_clear(points, vehicle_margin=PARKING_CANDIDATE_MARGIN):
+            return None
+        min_clearance = self._path_min_pose_clearance(
+            points,
+            vehicle_margin=PARKING_CANDIDATE_MARGIN,
+        )
+        if min_clearance <= 0.0:
+            return None
+        path_len = self._path_length(points)
+        tx, ty, target_yaw = target_pose
+        axis_x = math.cos(target_yaw)
+        axis_y = math.sin(target_yaw)
+        start_along = (points[0][0] - tx) * axis_x + (points[0][1] - ty) * axis_y
+        entry_sign = 1.0 if self._is_rear_parking_mode() else -1.0
+        wrong_side_penalty = 4.0 if start_along * entry_sign < -0.5 else 0.0
+        clearance_penalty = 3.0 / max(min_clearance, 0.12)
+        return (
+            path_len
+            + 1.3 * entry_distance
+            + 3.0 * abs(lateral_offset)
+            + clearance_penalty
+            + wrong_side_penalty
+        )
+
+    def _path_min_pose_clearance(
+        self,
+        points: List[Tuple[float, float]],
+        vehicle_margin: float,
+    ) -> float:
+        best = float("inf")
+        step = 0.5
+        for idx in range(len(points) - 1):
+            x0, y0 = points[idx]
+            x1, y1 = points[idx + 1]
+            seg_len = math.hypot(x1 - x0, y1 - y0)
+            if seg_len < 1e-6:
+                continue
+            yaw = math.atan2(y1 - y0, x1 - x0)
+            steps = max(1, int(math.ceil(seg_len / step)))
+            for i in range(steps + 1):
+                ratio = i / steps
+                px = x0 + (x1 - x0) * ratio
+                py = y0 + (y1 - y0) * ratio
+                best = min(
+                    best,
+                    self._estimate_pose_clearance(
+                        px,
+                        py,
+                        yaw,
+                        include_lines=True,
+                        vehicle_margin=vehicle_margin,
+                    ),
+                )
+        return best
 
     def _reset_parking_segment_from_current(
         self,
@@ -1081,7 +1230,10 @@ class PlannerSkeleton:
         y: float,
         target_pose: Tuple[float, float, float],
     ) -> None:
-        points = self._append_final_alignment([(x, y)], target_pose)
+        selected = self._select_parking_segment(x, y, target_pose)
+        if selected is None:
+            return
+        points, _ = selected
         self.waypoints = self._points_to_waypoints(
             points,
             final_yaw=target_pose[2],
@@ -1587,6 +1739,15 @@ class PlannerSkeleton:
                 return idx
             idx += 1
         return len(self.waypoints) - 1
+
+    def _segment_gear_for_target(self, target_idx: int) -> str:
+        if not self.waypoints:
+            return "D"
+        gear_idx = target_idx
+        if target_idx > self.waypoint_index:
+            gear_idx = max(self.waypoint_index, target_idx - 1)
+        gear_idx = max(0, min(gear_idx, len(self.waypoints) - 1))
+        return self.waypoints[gear_idx][3]
 
     def _adaptive_lookahead(self, speed: float, final_dist: float, yaw_error: float) -> float:
         lookahead = 1.65 + 0.45 * min(speed, 3.0)
