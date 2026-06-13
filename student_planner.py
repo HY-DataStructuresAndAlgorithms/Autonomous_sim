@@ -1062,7 +1062,8 @@ class PlannerSkeleton:
         points: List[Tuple[float, float]],
         vehicle_margin: float = PARKING_CANDIDATE_MARGIN,
     ) -> bool:
-        step = 0.5
+        step = 0.8
+        rects = self._collision_rects(include_lines=True)
         for idx in range(len(points) - 1):
             x0, y0 = points[idx]
             x1, y1 = points[idx + 1]
@@ -1075,13 +1076,13 @@ class PlannerSkeleton:
                 t = i / steps
                 px = x0 + (x1 - x0) * t
                 py = y0 + (y1 - y0) * t
-                if self._estimate_pose_clearance(
+                if self._pose_collides_with_rects(
                     px,
                     py,
                     yaw,
-                    include_lines=True,
+                    rects,
                     vehicle_margin=vehicle_margin,
-                ) <= 0.0:
+                ):
                     return False
         return True
 
@@ -1171,10 +1172,7 @@ class PlannerSkeleton:
             return None
         if not self._alignment_path_is_clear(points, vehicle_margin=PARKING_CANDIDATE_MARGIN):
             return None
-        min_clearance = self._path_min_pose_clearance(
-            points,
-            vehicle_margin=PARKING_CANDIDATE_MARGIN,
-        )
+        min_clearance = self._path_min_point_clearance(points)
         if min_clearance <= 0.0:
             return None
         path_len = self._path_length(points)
@@ -1193,35 +1191,20 @@ class PlannerSkeleton:
             + wrong_side_penalty
         )
 
-    def _path_min_pose_clearance(
+    def _path_min_point_clearance(
         self,
         points: List[Tuple[float, float]],
-        vehicle_margin: float,
     ) -> float:
         best = float("inf")
-        step = 0.5
-        for idx in range(len(points) - 1):
-            x0, y0 = points[idx]
-            x1, y1 = points[idx + 1]
-            seg_len = math.hypot(x1 - x0, y1 - y0)
-            if seg_len < 1e-6:
-                continue
-            yaw = math.atan2(y1 - y0, x1 - x0)
-            steps = max(1, int(math.ceil(seg_len / step)))
-            for i in range(steps + 1):
-                ratio = i / steps
-                px = x0 + (x1 - x0) * ratio
-                py = y0 + (y1 - y0) * ratio
-                best = min(
-                    best,
-                    self._estimate_pose_clearance(
-                        px,
-                        py,
-                        yaw,
-                        include_lines=True,
-                        vehicle_margin=vehicle_margin,
-                    ),
-                )
+        for point in points:
+            best = min(
+                best,
+                self._estimate_clearance(
+                    point,
+                    include_lines=True,
+                    vehicle_margin=PARKING_CANDIDATE_MARGIN,
+                ),
+            )
         return best
 
     def _reset_parking_segment_from_current(
@@ -2066,8 +2049,9 @@ class PlannerSkeleton:
         y: float,
         yaw: float,
         rects: List[Tuple[float, float, float, float]],
+        vehicle_margin: float = VEHICLE_RECT_MARGIN,
     ) -> bool:
-        vehicle_poly = self._vehicle_polygon(x, y, yaw, margin=VEHICLE_RECT_MARGIN)
+        vehicle_poly = self._vehicle_polygon(x, y, yaw, margin=vehicle_margin)
         if self._polygon_outside_map(vehicle_poly):
             return True
         vx0 = min(point[0] for point in vehicle_poly)
