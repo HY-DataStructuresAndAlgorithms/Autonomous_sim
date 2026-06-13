@@ -43,7 +43,8 @@ OBSTACLE_STOP_DISTANCE = 0.45
 FRONT_CLEAR_DISTANCE = 6.0
 FRONT_CLEAR_SPEED_BONUS = 0.75
 PARKING_ALIGN_DISTANCE = 4.0
-APPROACH_DISTANCE = 8.0
+FRONT_APPROACH_DISTANCE = 5.0
+REAR_APPROACH_DISTANCE = 8.0
 FINAL_ALIGNMENT_DISTANCES = (3.4, 2.4, 1.45, 0.75, 0.35, 0.0)
 FINAL_ALIGN_CLEARANCE_MIN = 0.10
 APPROACH_TARGET_TOLERANCE = 0.30
@@ -804,6 +805,9 @@ class PlannerSkeleton:
     def _is_rear_parking_mode(self) -> bool:
         return self.parking_mode.lower().startswith("rear")
 
+    def _approach_distance(self) -> float:
+        return REAR_APPROACH_DISTANCE if self._is_rear_parking_mode() else FRONT_APPROACH_DISTANCE
+
     def _slot_center(self, slot: List[float]) -> Tuple[float, float]:
         return (
             0.5 * (float(slot[0]) + float(slot[1])),
@@ -836,8 +840,9 @@ class PlannerSkeleton:
 
     def _approach_pose(self, slot: List[float], target_yaw: float) -> Tuple[float, float, float]:
         cx, cy = self._slot_center(slot)
-        above = (cx, cy + APPROACH_DISTANCE, target_yaw)
-        below = (cx, cy - APPROACH_DISTANCE, target_yaw)
+        approach_distance = self._approach_distance()
+        above = (cx, cy + approach_distance, target_yaw)
+        below = (cx, cy - approach_distance, target_yaw)
         preferred = (below, above) if self._is_rear_parking_mode() else (above, below)
         for candidate in preferred:
             if self._is_valid_approach_point(candidate[0], candidate[1], target_yaw):
@@ -850,8 +855,9 @@ class PlannerSkeleton:
         target_yaw: float,
     ) -> List[Tuple[float, float, float]]:
         cx, cy = self._slot_center(slot)
-        above = (cx, cy + APPROACH_DISTANCE, target_yaw)
-        below = (cx, cy - APPROACH_DISTANCE, target_yaw)
+        approach_distance = self._approach_distance()
+        above = (cx, cy + approach_distance, target_yaw)
+        below = (cx, cy - approach_distance, target_yaw)
         preferred = (below, above) if self._is_rear_parking_mode() else (above, below)
         candidates: List[Tuple[float, float, float]] = []
         for candidate in preferred:
