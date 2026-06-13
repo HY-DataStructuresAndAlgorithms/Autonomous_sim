@@ -353,7 +353,10 @@ class PlannerSkeleton:
                 not self.parking_segment_ready
                 and (
                     approach_remaining <= PARKING_SEGMENT_TRIGGER_DISTANCE
-                    or final_dist <= PARKING_ALIGN_DISTANCE
+                    or (
+                        self.debug_approach_point is None
+                        and final_dist <= PARKING_ALIGN_DISTANCE
+                    )
                 )
             )
             if parking_entry_triggered:
@@ -483,6 +486,7 @@ class PlannerSkeleton:
         )
         should_reverse_setup = (
             in_parking_mode
+            and self._is_rear_parking_mode()
             and self.parking_state in (PARKING_STATE_ALIGN_CHECK, PARKING_STATE_FORWARD_ALIGN)
             and (not self.parking_has_reversed or should_reverse_after_forward)
             and gear != "R"
@@ -1262,7 +1266,10 @@ class PlannerSkeleton:
         if not near_approach and not near_target:
             return False
 
-        selected = self._select_parking_segment(x, y, target_pose)
+        if not self._is_rear_parking_mode():
+            selected = self._front_direct_parking_segment(x, y, target_pose)
+        else:
+            selected = self._select_parking_segment(x, y, target_pose)
         if selected is None:
             # Parking entry candidates would collide or leave the map; keep
             # following the A* approach path and retry from a better pose.
@@ -1294,6 +1301,19 @@ class PlannerSkeleton:
             f"yaw={math.degrees(target_pose[2]):.1f}deg)"
         )
         return True
+
+    def _front_direct_parking_segment(
+        self,
+        x: float,
+        y: float,
+        target_pose: Tuple[float, float, float],
+    ) -> Tuple[List[Tuple[float, float]], float]:
+        tx, ty, _ = target_pose
+        points = [(x, y)]
+        if math.hypot(tx - x, ty - y) > 1.2:
+            points.append((0.5 * (x + tx), 0.5 * (y + ty)))
+        points.append((tx, ty))
+        return points, self._path_length(points)
 
     def _alignment_path_is_clear(
         self,
@@ -1937,7 +1957,10 @@ class PlannerSkeleton:
                     if near_target:
                         travel_dot = math.cos(self._wrap_to_pi(yaw - target_yaw))
                         yaw = target_yaw
-                        segment_gear = "D" if travel_dot >= 0.0 else "R"
+                        if self._is_rear_parking_mode():
+                            segment_gear = "D" if travel_dot >= 0.0 else "R"
+                        else:
+                            segment_gear = "D"
             else:
                 yaw = final_yaw
                 if waypoints:
