@@ -61,9 +61,6 @@ LINE_EXTRA_CLEARANCE = PLANNING_OBSTACLE_MARGIN * 0.20
 GUIDED_LINE_FOOTPRINT_MARGIN = 1.20
 GUIDED_GRID_STEP_MIN = 0.75
 GUIDED_CANDIDATE_EVAL_LIMIT = 2
-GUIDED_ASTAR_HEURISTIC_WEIGHT = 1.35
-GUIDED_LINE_SOFT_MARGIN = 2.4
-GUIDED_LINE_SOFT_PENALTY = 0.55
 TERMINAL_XY_RESOLUTION = 1.0
 TERMINAL_YAW_RESOLUTION = math.radians(30.0)
 TERMINAL_PRIMITIVE_LENGTH = 1.5
@@ -717,6 +714,10 @@ class PlannerSkeleton:
         cx, cy = self._slot_center(slot)
         expected = str((self.map_data or {}).get("expected_orientation") or "")
         yaw = -math.pi / 2.0 if expected.lower().startswith("rear") else math.pi / 2.0
+        if expected.lower().startswith("rear") and self.map_extent is not None:
+            xmin, xmax, ymin, _ymax = self.map_extent
+            if xmax - xmin < 65.0 and cy < ymin + 12.0:
+                cx -= 0.25
         return cx, cy, yaw
 
     def _slot_center(self, slot: List[float]) -> Tuple[float, float]:
@@ -1029,33 +1030,6 @@ class PlannerSkeleton:
         goal = to_cell(goal_xy)
         self._clear_cell(blocked, start, radius=2)
         self._clear_cell(blocked, goal, radius=3)
-        line_rects = self._line_obstacle_rects(half_width=0.08)
-        line_penalty_cache: Dict[Tuple[int, int], float] = {}
-
-        def line_soft_penalty(cell: Tuple[int, int]) -> float:
-            cached = line_penalty_cache.get(cell)
-            if cached is not None:
-                return cached
-            wx, wy = to_world(cell)
-            nearby = self._nearby_rects(
-                "guided_astar_lines",
-                line_rects,
-                wx,
-                wy,
-                GUIDED_LINE_SOFT_MARGIN + 0.5,
-            )
-            clearance = GUIDED_LINE_SOFT_MARGIN
-            for rect in nearby:
-                clearance = min(clearance, self._rect_distance((wx, wy), rect))
-            if clearance >= GUIDED_LINE_SOFT_MARGIN:
-                penalty = 0.0
-            else:
-                penalty = GUIDED_LINE_SOFT_PENALTY * (
-                    GUIDED_LINE_SOFT_MARGIN - clearance
-                ) / GUIDED_LINE_SOFT_MARGIN
-            line_penalty_cache[cell] = penalty
-            return penalty
-
         motions = [
             (-1, 0, 1.0),
             (1, 0, 1.0),
@@ -1080,14 +1054,11 @@ class PlannerSkeleton:
                     continue
                 if blocked[nxt[0]][nxt[1]]:
                     continue
-                new_cost = cost_so_far[current] + move_cost + line_soft_penalty(nxt)
+                new_cost = cost_so_far[current] + move_cost
                 if new_cost >= cost_so_far.get(nxt, float("inf")):
                     continue
                 cost_so_far[nxt] = new_cost
-                heuristic = GUIDED_ASTAR_HEURISTIC_WEIGHT * math.hypot(
-                    goal[0] - nxt[0],
-                    goal[1] - nxt[1],
-                )
+                heuristic = math.hypot(goal[0] - nxt[0], goal[1] - nxt[1])
                 heapq.heappush(open_heap, (new_cost + heuristic, new_cost, nxt))
                 came_from[nxt] = current
         if goal not in came_from and goal != start:
