@@ -67,6 +67,8 @@ PARKING_REVERSE_COOLDOWN_TICKS = 45
 PARKING_REVERSE_WALL_CLEARANCE = 0.85
 PARKING_REVERSE_REARM_CLEARANCE = 0.65
 PARKING_REVERSE_REARM_DISTANCE = 0.90
+PARKING_REVERSE_ARM_DISTANCE = 3.20
+PARKING_REVERSE_START_MAX_SPEED = 0.25
 PARKING_TARGET_OVERSHOOT = 0.30
 PARKING_REVERSE_DISTANCE = 2.10
 PARKING_REVERSE_STOP_CLEARANCE = 0.45
@@ -429,10 +431,24 @@ class PlannerSkeleton:
             self.parking_state = PARKING_STATE_ALIGN_CHECK
 
         should_reverse_for_alignment = (
-            final_yaw_error > PARKING_ALIGN_YAW_THRESHOLD
-            or abs(parking_lateral_error) > PARKING_ALIGN_LATERAL_THRESHOLD
+            (
+                final_dist <= PARKING_REVERSE_ARM_DISTANCE
+                or slot_entered
+                or target_overshot
+            )
+            and (
+                final_yaw_error > PARKING_ALIGN_YAW_THRESHOLD
+                or abs(parking_lateral_error) > PARKING_ALIGN_LATERAL_THRESHOLD
+            )
         )
-        should_reverse_for_obstacle = forward_clearance < PARKING_REVERSE_WALL_CLEARANCE
+        should_reverse_for_obstacle = (
+            forward_clearance < PARKING_REVERSE_WALL_CLEARANCE
+            and (
+                final_dist <= PARKING_ALIGN_DISTANCE
+                or slot_entered
+                or target_overshot
+            )
+        )
         should_reverse_after_forward = (
             self.parking_reverse_completed
             and forward_after_reverse >= PARKING_REVERSE_REARM_DISTANCE
@@ -474,6 +490,8 @@ class PlannerSkeleton:
             self.parking_state = PARKING_STATE_FORWARD_ALIGN
 
         if in_parking_mode and self.parking_state == PARKING_STATE_REVERSE_SETUP:
+            if speed > PARKING_REVERSE_START_MAX_SPEED:
+                return self._command(steer=0.0, accel=0.0, brake=1.0, gear="D")
             reverse_distance = self._parking_reverse_distance(x, y)
             reverse_clearance = self._estimate_forward_clearance(
                 x=x,
