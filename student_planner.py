@@ -86,6 +86,9 @@ A_STAR_USE_POSE_GRID = False
 START_ALIGNMENT_DISTANCE = 2.2
 START_ALIGNMENT_MIN_SPEED = 0.35
 START_STEER_LIMIT = math.radians(14.0)
+PARKING_SUCCESS_IOU = 0.30
+PARKING_STOP_SPEED = 0.20
+PARKING_ORIENTATION_ALIGNMENT_THRESHOLD = math.cos(math.radians(48.0))
 
 
 def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
@@ -305,8 +308,18 @@ class PlannerSkeleton:
         obstacle_dist = self._estimate_min_obstacle_distance((x, y), yaw=yaw)
         self.min_obstacle_distance = min(self.min_obstacle_distance, obstacle_dist)
         collision_risk = False
+        parking_iou = self._slot_iou(slot, x, y, yaw) if len(slot) == 4 else 0.0
+        actual_orientation = (
+            self._parking_orientation_label(slot, yaw) if len(slot) == 4 else "unknown"
+        )
+        orientation_ok = actual_orientation == self.parking_mode
+        simulator_ready_to_stop = (
+            len(slot) == 4
+            and parking_iou >= PARKING_SUCCESS_IOU
+            and orientation_ok
+        )
 
-        if final_dist <= center_tolerance and final_yaw_error < math.radians(14.0):
+        if simulator_ready_to_stop and speed <= PARKING_STOP_SPEED:
             self._log_evaluation(
                 parking_success=True,
                 fail_reason="none",
@@ -315,15 +328,18 @@ class PlannerSkeleton:
                 collision=collision_risk,
                 force=True,
             )
-            if speed < 0.18:
-                print(
-                    "[algo] parking succeeded:"
-                    f" pos_error={final_dist:.2f}m"
-                    f" center_tolerance={center_tolerance:.2f}m"
-                    f" yaw_error={math.degrees(final_yaw_error):.1f}deg"
-                    f" steps={self.step_count}"
-                    f" min_obstacle_dist~{self.min_obstacle_distance:.2f}m"
+            print(
+                "[algo] parking succeeded:"
+                f" pos_error={final_dist:.2f}m"
+                f" slot_iou={parking_iou:.2f}"
+                f" orientation={actual_orientation}/{self.parking_mode}"
+                f" speed={speed:.2f}m/s"
+                f" yaw_error={math.degrees(final_yaw_error):.1f}deg"
+                f" steps={self.step_count}"
+                f" min_obstacle_dist~{self.min_obstacle_distance:.2f}m"
             )
+            return self._command(steer=0.0, accel=0.0, brake=1.0, gear="D")
+        if simulator_ready_to_stop:
             return self._command(steer=0.0, accel=0.0, brake=1.0, gear="D")
 
         self._advance_waypoint_index(x, y)
@@ -616,6 +632,8 @@ class PlannerSkeleton:
                 f" approach_remaining={approach_remaining:.2f}m"
                 f" center_tolerance={center_tolerance:.2f}m"
                 f" slot_entered={slot_entered}"
+                f" slot_iou={parking_iou:.2f}"
+                f" orientation={actual_orientation}/{self.parking_mode}"
                 f" parking_state={self.parking_state}"
                 f" parking_mode={self.parking_mode}"
                 f" tracking_yaw_error={math.degrees(tracking_yaw_error):.1f}deg"
@@ -797,14 +815,39 @@ class PlannerSkeleton:
         return cx, cy, yaw
 
     def _expected_parking_mode(self, obs: Optional[Dict[str, Any]] = None) -> str:
-        expected = ""
-        if obs is not None:
-            expected = str(obs.get("expected_orientation") or "").lower()
-        if not expected:
-            expected = str((self.map_data or {}).get("expected_orientation") or "").lower()
-        if expected.startswith("rear"):
+        expected = self._find_parking_mode_text(obs)
+        if "rear" in expected:
             return "rear_in"
+        if "front" in expected:
+            return "front_in"
         return "front_in"
+
+    def _find_parking_mode_text(self, obs: Optional[Dict[str, Any]] = None) -> str:
+        keys = (
+            "expected_orientation",
+            "parking_orientation",
+            "required_orientation",
+            "orientation",
+            "requirement",
+            "stage",
+            "stage_name",
+            "map_name",
+            "map_id",
+        )
+        sources: List[Dict[str, Any]] = []
+        if obs is not None:
+            sources.append(obs)
+        if self.map_data:
+            sources.append(self.map_data)
+        for source in sources:
+            for key in keys:
+                value = source.get(key)
+                if value is None:
+                    continue
+                text = str(value).lower()
+                if "rear" in text or "front" in text:
+                    return text
+        return ""
 
     def _is_rear_parking_mode(self) -> bool:
         return self.parking_mode.lower().startswith("rear")
@@ -822,6 +865,90 @@ class PlannerSkeleton:
         slot_w = abs(float(slot[1]) - float(slot[0]))
         slot_l = abs(float(slot[3]) - float(slot[2]))
         return max(0.15, 0.05 * min(slot_w, slot_l))
+
+    def _slot_iou(self, slot: List[float], x: float, y: float, yaw: float) -> float:
+        if len(slot) != 4:
+            return 0.0
+        slot_rect = tuple(float(v) for v in slot)
+        car_poly = self._vehicle_polygon(x, y, yaw, margin=0.0)
+        intersection = self._clip_polygon_with_rect(car_poly, slot_rect)
+        intersection_area = self._polygon_area(intersection)
+        if intersection_area <= 0.0:
+            return 0.0
+        car_area = self._polygon_area(car_poly)
+        slot_area = max(0.0, (slot_rect[1] - slot_rect[0]) * (slot_rect[3] - slot_rect[2]))
+        union_area = max(car_area + slot_area - intersection_area, 1e-9)
+        return intersection_area / union_area
+
+    def _parking_orientation_label(self, slot: List[float], yaw: float) -> str:
+        if len(slot) != 4:
+            return "unknown"
+        slot_rect = tuple(float(v) for v in slot)
+        width = slot_rect[1] - slot_rect[0]
+        height = slot_rect[3] - slot_rect[2]
+        forward_x = math.cos(yaw)
+        forward_y = math.sin(yaw)
+        axis_value = forward_y if height >= width else forward_x
+        if abs(axis_value) < PARKING_ORIENTATION_ALIGNMENT_THRESHOLD:
+            return "unknown"
+        return "front_in" if axis_value >= 0.0 else "rear_in"
+
+    def _polygon_area(self, poly: List[Tuple[float, float]]) -> float:
+        if len(poly) < 3:
+            return 0.0
+        area = 0.0
+        for idx, (x1, y1) in enumerate(poly):
+            x2, y2 = poly[(idx + 1) % len(poly)]
+            area += x1 * y2 - x2 * y1
+        return abs(area) * 0.5
+
+    def _clip_polygon_with_rect(
+        self,
+        poly: List[Tuple[float, float]],
+        rect: Tuple[float, float, float, float],
+    ) -> List[Tuple[float, float]]:
+        xmin, xmax, ymin, ymax = rect
+
+        def clip_edge(points, inside_fn, intersect_fn):
+            if not points:
+                return []
+            clipped = []
+            start = points[-1]
+            start_inside = inside_fn(start)
+            for end in points:
+                end_inside = inside_fn(end)
+                if end_inside:
+                    if not start_inside:
+                        clipped.append(intersect_fn(start, end))
+                    clipped.append(end)
+                elif start_inside:
+                    clipped.append(intersect_fn(start, end))
+                start = end
+                start_inside = end_inside
+            return clipped
+
+        def intersect_vertical(start, end, x_bound):
+            sx, sy = start
+            ex, ey = end
+            if abs(ex - sx) < 1e-9:
+                return x_bound, sy
+            ratio = (x_bound - sx) / (ex - sx)
+            return x_bound, sy + ratio * (ey - sy)
+
+        def intersect_horizontal(start, end, y_bound):
+            sx, sy = start
+            ex, ey = end
+            if abs(ey - sy) < 1e-9:
+                return sx, y_bound
+            ratio = (y_bound - sy) / (ey - sy)
+            return sx + ratio * (ex - sx), y_bound
+
+        points = poly
+        points = clip_edge(points, lambda point: point[0] >= xmin, lambda s, e: intersect_vertical(s, e, xmin))
+        points = clip_edge(points, lambda point: point[0] <= xmax, lambda s, e: intersect_vertical(s, e, xmax))
+        points = clip_edge(points, lambda point: point[1] >= ymin, lambda s, e: intersect_horizontal(s, e, ymin))
+        points = clip_edge(points, lambda point: point[1] <= ymax, lambda s, e: intersect_horizontal(s, e, ymax))
+        return points
 
     def _point_in_slot(self, slot: List[float], x: float, y: float, margin: float = 0.0) -> bool:
         return (
