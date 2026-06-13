@@ -127,6 +127,7 @@ class PlannerSkeleton:
     parking_state: str = PARKING_STATE_APPROACH
     parking_reverse_start: Optional[Tuple[float, float]] = None
     debug_approach_point: Optional[Tuple[float, float]] = None
+    debug_astar_path: Optional[List[Tuple[float, float]]] = None
     parking_mode: str = "front_in"
     approach_stuck_anchor: Optional[Tuple[float, float, float]] = None
     approach_recovery_start: Optional[Tuple[float, float]] = None
@@ -169,6 +170,7 @@ class PlannerSkeleton:
         self.parking_state = PARKING_STATE_APPROACH
         self.parking_reverse_start = None
         self.debug_approach_point = None
+        self.debug_astar_path = None
         self.parking_mode = self._expected_parking_mode()
         self.approach_stuck_anchor = None
         self.approach_recovery_start = None
@@ -192,6 +194,7 @@ class PlannerSkeleton:
         self.parking_state = PARKING_STATE_APPROACH
         self.parking_reverse_start = None
         self.debug_approach_point = None
+        self.debug_astar_path = None
         self.approach_stuck_anchor = None
         self.approach_recovery_start = None
         self.approach_forward_recovery_start = None
@@ -226,6 +229,7 @@ class PlannerSkeleton:
             self.planning_fail_reason = None
             approach_pose, grid_path, cost = best_plan
             self.debug_approach_point = (approach_pose[0], approach_pose[1])
+            self.debug_astar_path = list(grid_path)
             print(
                 "[algo] planning success:"
                 f" candidates={len(candidates)}"
@@ -635,6 +639,11 @@ class PlannerSkeleton:
             command["debug_approach_point"] = [
                 float(self.debug_approach_point[0]),
                 float(self.debug_approach_point[1]),
+            ]
+        if self.debug_astar_path:
+            command["debug_astar_path"] = [
+                [float(point[0]), float(point[1])]
+                for point in self.debug_astar_path
             ]
         return command
 
