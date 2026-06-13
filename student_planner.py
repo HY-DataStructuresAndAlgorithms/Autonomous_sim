@@ -47,7 +47,7 @@ APPROACH_DISTANCE = 4.0
 FINAL_ALIGNMENT_DISTANCES = (3.4, 2.4, 1.45, 0.75, 0.35, 0.0)
 FINAL_ALIGN_CLEARANCE_MIN = 0.10
 APPROACH_TARGET_TOLERANCE = 0.30
-PARKING_SEGMENT_TRIGGER_DISTANCE = APPROACH_TARGET_TOLERANCE
+PARKING_SEGMENT_TRIGGER_DISTANCE = 2.00
 APPROACH_CRUISE_SPEED = 5.30
 PARKING_REVERSE_YAW_ERROR = math.radians(32.0)
 PARKING_REVERSE_TICKS = 58
@@ -120,6 +120,7 @@ class PlannerSkeleton:
     parking_state: str = PARKING_STATE_APPROACH
     parking_reverse_start: Optional[Tuple[float, float]] = None
     debug_approach_point: Optional[Tuple[float, float]] = None
+    parking_mode: str = "front_in"
 
     def __post_init__(self) -> None:
         if self.waypoints is None:
@@ -158,8 +159,10 @@ class PlannerSkeleton:
         self.parking_state = PARKING_STATE_APPROACH
         self.parking_reverse_start = None
         self.debug_approach_point = None
+        self.parking_mode = self._expected_parking_mode()
         self.rl_speed = RLSpeedController(enabled=USE_RL_SPEED_CONTROL)
         self._warm_planning_caches(warm_pose_grid=False)
+        print(f"[algo] parking_mode={self.parking_mode}")
         print(f"[algo] rl_speed_control={'ON' if USE_RL_SPEED_CONTROL else 'OFF'}")
 
     def compute_path(self, obs: Dict[str, Any]) -> None:
@@ -177,6 +180,7 @@ class PlannerSkeleton:
         self.parking_reverse_start = None
         self.debug_approach_point = None
         state = obs.get("state", {})
+        self.parking_mode = self._expected_parking_mode(obs)
         start = (
             float(state.get("x", 0.0)),
             float(state.get("y", 0.0)),
@@ -211,6 +215,7 @@ class PlannerSkeleton:
                 f" candidates={len(candidates)}"
                 f" selected=({approach_pose[0]:.2f}, {approach_pose[1]:.2f})"
                 f" a_star_points={len(grid_path)} cost={cost:.2f}"
+                f" parking_mode={self.parking_mode}"
             )
 
         simplified = self._simplify_path(grid_path, spacing=1.0)
@@ -228,6 +233,7 @@ class PlannerSkeleton:
             "[algo] path ready:"
             f" waypoints={len(self.waypoints)}"
             f" stage=approach_only"
+            f" parking_mode={self.parking_mode}"
             f" target=({target_pose[0]:.2f}, {target_pose[1]:.2f}, "
             f"yaw={math.degrees(target_pose[2]):.1f}deg)"
             f" min_obstacle_dist~{initial_clearance:.2f}m"
@@ -307,7 +313,7 @@ class PlannerSkeleton:
         approach_pending = (
             self.debug_approach_point is not None
             and not self.parking_segment_ready
-            and approach_remaining > APPROACH_TARGET_TOLERANCE
+            and approach_remaining > PARKING_SEGMENT_TRIGGER_DISTANCE
         )
         in_parking_mode = (
             (final_dist < PARKING_ALIGN_DISTANCE and not approach_pending)
@@ -574,6 +580,7 @@ class PlannerSkeleton:
                 f" center_tolerance={center_tolerance:.2f}m"
                 f" slot_entered={slot_entered}"
                 f" parking_state={self.parking_state}"
+                f" parking_mode={self.parking_mode}"
                 f" tracking_yaw_error={math.degrees(tracking_yaw_error):.1f}deg"
                 f" final_yaw_error={math.degrees(final_yaw_error):.1f}deg"
                 f" min_obstacle_dist~{self.min_obstacle_distance:.2f}m"
@@ -605,9 +612,21 @@ class PlannerSkeleton:
 
     def _target_pose(self, slot: List[float]) -> Tuple[float, float, float]:
         cx, cy = self._slot_center(slot)
-        expected = str((self.map_data or {}).get("expected_orientation") or "")
-        yaw = -math.pi / 2.0 if expected.lower().startswith("rear") else math.pi / 2.0
+        yaw = -math.pi / 2.0 if self._is_rear_parking_mode() else math.pi / 2.0
         return cx, cy, yaw
+
+    def _expected_parking_mode(self, obs: Optional[Dict[str, Any]] = None) -> str:
+        expected = ""
+        if obs is not None:
+            expected = str(obs.get("expected_orientation") or "").lower()
+        if not expected:
+            expected = str((self.map_data or {}).get("expected_orientation") or "").lower()
+        if expected.startswith("rear"):
+            return "rear_in"
+        return "front_in"
+
+    def _is_rear_parking_mode(self) -> bool:
+        return self.parking_mode.lower().startswith("rear")
 
     def _slot_center(self, slot: List[float]) -> Tuple[float, float]:
         return (
@@ -642,9 +661,12 @@ class PlannerSkeleton:
     def _approach_pose(self, slot: List[float], target_yaw: float) -> Tuple[float, float, float]:
         cx, cy = self._slot_center(slot)
         above = (cx, cy + APPROACH_DISTANCE, target_yaw)
-        if self._is_valid_approach_point(above[0], above[1], target_yaw):
-            return above
-        return cx, cy - APPROACH_DISTANCE, target_yaw
+        below = (cx, cy - APPROACH_DISTANCE, target_yaw)
+        preferred = (below, above) if self._is_rear_parking_mode() else (above, below)
+        for candidate in preferred:
+            if self._is_valid_approach_point(candidate[0], candidate[1], target_yaw):
+                return candidate
+        return preferred[-1]
 
     def _approach_candidates(
         self,
@@ -654,11 +676,12 @@ class PlannerSkeleton:
         cx, cy = self._slot_center(slot)
         above = (cx, cy + APPROACH_DISTANCE, target_yaw)
         below = (cx, cy - APPROACH_DISTANCE, target_yaw)
+        preferred = (below, above) if self._is_rear_parking_mode() else (above, below)
         candidates: List[Tuple[float, float, float]] = []
-        if self._is_valid_approach_point(above[0], above[1], target_yaw):
-            candidates.append(above)
-        elif self._is_valid_approach_point(below[0], below[1], target_yaw):
-            candidates.append(below)
+        for candidate in preferred:
+            if self._is_valid_approach_point(candidate[0], candidate[1], target_yaw):
+                candidates.append(candidate)
+                break
         if candidates:
             return candidates
         fallback_x, fallback_y = self._clamp_inside_map(below[0], below[1])
