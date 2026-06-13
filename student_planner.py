@@ -1017,17 +1017,15 @@ class PlannerSkeleton:
     def _approach_pose(self, slot: List[float], target_yaw: float) -> Tuple[float, float, float]:
         cx, cy = self._slot_center(slot)
         approach_distance = self._approach_distance()
-        axis_x = math.cos(target_yaw)
-        axis_y = math.sin(target_yaw)
-        entry_sign = 1.0 if self._is_rear_parking_mode() else -1.0
+        approach_y_sign = self._approach_y_sign(slot)
         primary = (
-            cx + entry_sign * axis_x * approach_distance,
-            cy + entry_sign * axis_y * approach_distance,
+            cx,
+            cy + approach_y_sign * approach_distance,
             target_yaw,
         )
         secondary = (
-            cx - entry_sign * axis_x * approach_distance,
-            cy - entry_sign * axis_y * approach_distance,
+            cx,
+            cy - approach_y_sign * approach_distance,
             target_yaw,
         )
         preferred = (primary, secondary)
@@ -1043,17 +1041,15 @@ class PlannerSkeleton:
     ) -> List[Tuple[float, float, float]]:
         cx, cy = self._slot_center(slot)
         approach_distance = self._approach_distance()
-        axis_x = math.cos(target_yaw)
-        axis_y = math.sin(target_yaw)
-        entry_sign = 1.0 if self._is_rear_parking_mode() else -1.0
+        approach_y_sign = self._approach_y_sign(slot)
         primary = (
-            cx + entry_sign * axis_x * approach_distance,
-            cy + entry_sign * axis_y * approach_distance,
+            cx,
+            cy + approach_y_sign * approach_distance,
             target_yaw,
         )
         secondary = (
-            cx - entry_sign * axis_x * approach_distance,
-            cy - entry_sign * axis_y * approach_distance,
+            cx,
+            cy - approach_y_sign * approach_distance,
             target_yaw,
         )
         preferred = (primary, secondary)
@@ -1066,6 +1062,47 @@ class PlannerSkeleton:
             return candidates
         fallback_x, fallback_y = self._clamp_inside_map(primary[0], primary[1])
         return [(fallback_x, fallback_y, target_yaw)]
+
+    def _approach_y_sign(self, slot: List[float]) -> float:
+        _, cy = self._slot_center(slot)
+        if not self.map_data:
+            return 1.0
+        slots = self.map_data.get("slots") or []
+        centers_y = [
+            0.5 * (float(other[2]) + float(other[3]))
+            for other in slots
+            if len(other) == 4
+        ]
+        if not centers_y:
+            return 1.0
+        top_row_y = max(centers_y)
+        row_gap = max(1.0, abs(float(slot[3]) - float(slot[2])) * 0.75)
+        # Top-row slots are approached from below; middle/bottom rows from above.
+        return -1.0 if abs(cy - top_row_y) <= row_gap else 1.0
+
+    def _entry_sign_for_target(self, target_pose: Tuple[float, float, float]) -> float:
+        tx, ty, target_yaw = target_pose
+        slot = self._nearest_slot_to_target(tx, ty)
+        approach_y_sign = self._approach_y_sign(slot) if slot is not None else 1.0
+        axis_y = math.sin(target_yaw)
+        if abs(axis_y) < 1e-6:
+            return 1.0
+        return 1.0 if approach_y_sign * axis_y >= 0.0 else -1.0
+
+    def _nearest_slot_to_target(self, tx: float, ty: float) -> Optional[List[float]]:
+        if not self.map_data:
+            return None
+        best_slot = None
+        best_dist = float("inf")
+        for slot in self.map_data.get("slots") or []:
+            if len(slot) != 4:
+                continue
+            cx, cy = self._slot_center(slot)
+            dist = math.hypot(cx - tx, cy - ty)
+            if dist < best_dist:
+                best_dist = dist
+                best_slot = slot
+        return best_slot
 
     def _is_valid_approach_point(self, x: float, y: float, yaw: float) -> bool:
         return self._pose_is_collision_free(x, y, yaw, include_lines=True)
@@ -1328,7 +1365,7 @@ class PlannerSkeleton:
         axis_y = math.sin(target_yaw)
         lateral_x = -axis_y
         lateral_y = axis_x
-        entry_sign = 1.0 if self._is_rear_parking_mode() else -1.0
+        entry_sign = self._entry_sign_for_target(target_pose)
         points: List[Tuple[float, float]] = [(x, y)]
 
         entry_point = (
@@ -1381,7 +1418,7 @@ class PlannerSkeleton:
         axis_x = math.cos(target_yaw)
         axis_y = math.sin(target_yaw)
         start_along = (points[0][0] - tx) * axis_x + (points[0][1] - ty) * axis_y
-        entry_sign = 1.0 if self._is_rear_parking_mode() else -1.0
+        entry_sign = self._entry_sign_for_target(target_pose)
         wrong_side_penalty = 4.0 if start_along * entry_sign < -0.5 else 0.0
         clearance_penalty = 3.0 / max(min_clearance, 0.12)
         return (
