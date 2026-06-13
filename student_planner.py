@@ -54,6 +54,8 @@ APPROACH_STUCK_MIN_DISTANCE = 2.0
 APPROACH_STUCK_FRONT_BLOCKED = 1.20
 APPROACH_STUCK_REVERSE_DISTANCE = 1.80
 APPROACH_STUCK_REVERSE_STOP_CLEARANCE = 0.45
+APPROACH_STUCK_FORWARD_DISTANCE = 1.20
+APPROACH_STUCK_FORWARD_STOP_CLEARANCE = 0.45
 PARKING_REVERSE_YAW_ERROR = math.radians(32.0)
 PARKING_REVERSE_TICKS = 58
 PARKING_REVERSE_COOLDOWN_TICKS = 45
@@ -128,6 +130,7 @@ class PlannerSkeleton:
     parking_mode: str = "front_in"
     approach_stuck_anchor: Optional[Tuple[float, float, float]] = None
     approach_recovery_start: Optional[Tuple[float, float]] = None
+    approach_forward_recovery_start: Optional[Tuple[float, float]] = None
 
     def __post_init__(self) -> None:
         if self.waypoints is None:
@@ -169,6 +172,7 @@ class PlannerSkeleton:
         self.parking_mode = self._expected_parking_mode()
         self.approach_stuck_anchor = None
         self.approach_recovery_start = None
+        self.approach_forward_recovery_start = None
         self.rl_speed = RLSpeedController(enabled=USE_RL_SPEED_CONTROL)
         self._warm_planning_caches(warm_pose_grid=False)
         print(f"[algo] parking_mode={self.parking_mode}")
@@ -190,6 +194,7 @@ class PlannerSkeleton:
         self.debug_approach_point = None
         self.approach_stuck_anchor = None
         self.approach_recovery_start = None
+        self.approach_forward_recovery_start = None
         state = obs.get("state", {})
         self.parking_mode = self._expected_parking_mode(obs)
         start = (
@@ -644,6 +649,35 @@ class PlannerSkeleton:
         moving_to_approach: bool,
         front_clearance: float,
     ) -> Optional[Dict[str, Any]]:
+        if self.approach_forward_recovery_start is not None:
+            forward_distance = math.hypot(
+                x - self.approach_forward_recovery_start[0],
+                y - self.approach_forward_recovery_start[1],
+            )
+            forward_clearance = self._estimate_forward_clearance(
+                x=x,
+                y=y,
+                yaw=yaw,
+                reverse=False,
+                steer=0.0,
+                wheelbase=wheelbase,
+                vehicle_margin=VEHICLE_RECT_MARGIN,
+            )
+            if (
+                forward_distance >= APPROACH_STUCK_FORWARD_DISTANCE
+                or forward_clearance < APPROACH_STUCK_FORWARD_STOP_CLEARANCE
+            ):
+                print(
+                    "[algo] approach recovery: forward complete, replanning"
+                    f" forward_distance={forward_distance:.2f}m"
+                    f" forward_clearance={forward_clearance:.2f}m"
+                )
+                self.approach_forward_recovery_start = None
+                self.approach_stuck_anchor = None
+                self.compute_path(obs)
+                return self._command(steer=0.0, accel=0.0, brake=0.4, gear="D")
+            return self._command(steer=0.0, accel=0.45, brake=0.0, gear="D")
+
         if self.approach_recovery_start is not None:
             reverse_distance = math.hypot(
                 x - self.approach_recovery_start[0],
@@ -658,10 +692,27 @@ class PlannerSkeleton:
                 wheelbase=wheelbase,
                 vehicle_margin=VEHICLE_RECT_MARGIN,
             )
-            if (
-                reverse_distance >= APPROACH_STUCK_REVERSE_DISTANCE
-                or reverse_clearance < APPROACH_STUCK_REVERSE_STOP_CLEARANCE
-            ):
+            if reverse_clearance < APPROACH_STUCK_REVERSE_STOP_CLEARANCE:
+                if front_clearance > APPROACH_STUCK_FORWARD_STOP_CLEARANCE:
+                    print(
+                        "[algo] approach recovery: rear blocked, moving forward"
+                        f" reverse_distance={reverse_distance:.2f}m"
+                        f" rear_clearance={reverse_clearance:.2f}m"
+                        f" front_clearance={front_clearance:.2f}m"
+                    )
+                    self.approach_recovery_start = None
+                    self.approach_forward_recovery_start = (x, y)
+                    return self._command(steer=0.0, accel=0.45, brake=0.0, gear="D")
+                print(
+                    "[algo] approach recovery: front and rear blocked, replanning"
+                    f" rear_clearance={reverse_clearance:.2f}m"
+                    f" front_clearance={front_clearance:.2f}m"
+                )
+                self.approach_recovery_start = None
+                self.approach_stuck_anchor = None
+                self.compute_path(obs)
+                return self._command(steer=0.0, accel=0.0, brake=0.8, gear="D")
+            if reverse_distance >= APPROACH_STUCK_REVERSE_DISTANCE:
                 print(
                     "[algo] approach recovery: reverse complete, replanning"
                     f" reverse_distance={reverse_distance:.2f}m"
@@ -692,6 +743,24 @@ class PlannerSkeleton:
 
         self.approach_stuck_anchor = None
         if front_clearance < APPROACH_STUCK_FRONT_BLOCKED:
+            rear_clearance = self._estimate_forward_clearance(
+                x=x,
+                y=y,
+                yaw=yaw,
+                reverse=True,
+                steer=0.0,
+                wheelbase=wheelbase,
+                vehicle_margin=VEHICLE_RECT_MARGIN,
+            )
+            if rear_clearance < APPROACH_STUCK_REVERSE_STOP_CLEARANCE:
+                self.approach_forward_recovery_start = (x, y)
+                print(
+                    "[algo] approach stuck: rear blocked, moving forward before replan"
+                    f" moved={moved:.2f}m/{APPROACH_STUCK_SECONDS:.1f}s"
+                    f" rear_clearance={rear_clearance:.2f}m"
+                    f" front_clearance={front_clearance:.2f}m"
+                )
+                return self._command(steer=0.0, accel=0.45, brake=0.0, gear="D")
             self.approach_recovery_start = (x, y)
             print(
                 "[algo] approach stuck: front blocked, reversing before replan"
