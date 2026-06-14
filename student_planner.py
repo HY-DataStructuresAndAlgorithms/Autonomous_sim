@@ -55,6 +55,9 @@ PARKING_CANDIDATE_MARGIN = 0.18
 APPROACH_TARGET_TOLERANCE = 0.30
 PARKING_SEGMENT_TRIGGER_DISTANCE = 6.00
 APPROACH_CRUISE_SPEED = 5.30
+APPROACH_LOOKAHEAD_WINDOW = 18
+APPROACH_CURVATURE_SLOW_ANGLE = math.radians(32.0)
+APPROACH_CURVATURE_SLOW_SPEED = 1.35
 APPROACH_STUCK_SECONDS = 3.0
 APPROACH_STUCK_MIN_DISTANCE = 2.0
 APPROACH_STUCK_FRONT_BLOCKED = 1.20
@@ -397,11 +400,14 @@ class PlannerSkeleton:
             and not self.parking_segment_ready
             and approach_remaining > PARKING_SEGMENT_TRIGGER_DISTANCE
         )
+        approach_tracking = approach_pending and final_dist > 2.2
         in_parking_mode = (
             (final_dist < PARKING_ALIGN_DISTANCE and not approach_pending)
             or self.parking_segment_ready
             or self.parking_state != PARKING_STATE_APPROACH
         )
+        if approach_tracking:
+            self._advance_approach_waypoint_index(x, y)
         tracking_reference = self.waypoints[min(self.waypoint_index + 1, len(self.waypoints) - 1)]
         tracking_yaw_error = self._tracking_yaw_error(
             x=x,
@@ -412,9 +418,17 @@ class PlannerSkeleton:
         )
         control_yaw_error = final_yaw_error if in_parking_mode else tracking_yaw_error
         lookahead = self._adaptive_lookahead(speed, final_dist, control_yaw_error)
-        target_idx = self._lookahead_index(x, y, lookahead=lookahead)
+        if approach_tracking:
+            target_idx = self._approach_lookahead_index(x, y, lookahead=lookahead)
+        else:
+            target_idx = self._lookahead_index(x, y, lookahead=lookahead)
         target_wp = self.waypoints[target_idx]
         gear = self._segment_gear_for_target(target_idx)
+        approach_curvature = (
+            self._approach_path_curvature(self.waypoint_index)
+            if approach_tracking
+            else 0.0
+        )
         reverse_realigning = False
         forward_clearance = self._estimate_forward_clearance(
             x=x,
@@ -446,7 +460,7 @@ class PlannerSkeleton:
         if self.parking_reverse_cooldown > 0:
             self.parking_reverse_cooldown -= 1
         moving_to_approach = (
-            approach_pending
+            approach_tracking
             and final_dist > 2.2
             and gear == "D"
         )
@@ -641,6 +655,8 @@ class PlannerSkeleton:
                 steer_abs=abs(steer),
                 front_clearance=front_clearance,
             )
+            if approach_curvature >= APPROACH_CURVATURE_SLOW_ANGLE:
+                rule_speed = min(rule_speed, APPROACH_CURVATURE_SLOW_SPEED)
         if gear == "R":
             rule_speed = min(rule_speed, 0.55)
         if (
@@ -710,6 +726,7 @@ class PlannerSkeleton:
                 f" front_clearance~{front_clearance:.2f}m"
                 f" gear={gear}"
                 f" lookahead={lookahead:.2f}m"
+                f" path_curvature={math.degrees(approach_curvature):.1f}deg"
                 f" rule_speed={rule_speed:.2f}m/s"
                 f" speed={target_speed:.2f}m/s"
                 f" rl={'ON' if self.rl_speed.enabled else 'OFF'}"
@@ -2003,6 +2020,11 @@ class PlannerSkeleton:
                 break
             self.waypoint_index += 1
 
+    def _advance_approach_waypoint_index(self, x: float, y: float) -> None:
+        nearest_idx = self._nearest_future_path_index(x, y)
+        if nearest_idx > self.waypoint_index:
+            self.waypoint_index = nearest_idx
+
     def _lookahead_index(self, x: float, y: float, lookahead: float) -> int:
         idx = self.waypoint_index
         while idx < len(self.waypoints) - 1:
@@ -2011,6 +2033,73 @@ class PlannerSkeleton:
                 return idx
             idx += 1
         return len(self.waypoints) - 1
+
+    def _approach_lookahead_index(self, x: float, y: float, lookahead: float) -> int:
+        reference_idx = self._nearest_future_path_index(x, y)
+        reference_idx = max(self.waypoint_index, reference_idx)
+        distance_accum = 0.0
+        idx = reference_idx
+        while idx < len(self.waypoints) - 1:
+            current = self.waypoints[idx]
+            nxt = self.waypoints[idx + 1]
+            distance_accum += math.hypot(nxt[0] - current[0], nxt[1] - current[1])
+            idx += 1
+            if distance_accum >= lookahead:
+                return idx
+        return len(self.waypoints) - 1
+
+    def _nearest_future_path_index(self, x: float, y: float) -> int:
+        if not self.waypoints:
+            return 0
+        start_idx = max(0, min(self.waypoint_index, len(self.waypoints) - 1))
+        end_idx = min(len(self.waypoints) - 1, start_idx + APPROACH_LOOKAHEAD_WINDOW)
+        if start_idx >= end_idx:
+            return start_idx
+        best_idx = start_idx
+        best_dist = float("inf")
+        for idx in range(start_idx, end_idx):
+            ax, ay = self.waypoints[idx][0], self.waypoints[idx][1]
+            bx, by = self.waypoints[idx + 1][0], self.waypoints[idx + 1][1]
+            seg_dist, seg_t = self._approach_point_to_segment_distance(x, y, ax, ay, bx, by)
+            if seg_dist < best_dist:
+                best_dist = seg_dist
+                best_idx = idx + 1 if seg_t > 0.65 else idx
+        return max(start_idx, min(best_idx, len(self.waypoints) - 1))
+
+    def _approach_point_to_segment_distance(
+        self,
+        px: float,
+        py: float,
+        ax: float,
+        ay: float,
+        bx: float,
+        by: float,
+    ) -> Tuple[float, float]:
+        dx = bx - ax
+        dy = by - ay
+        denom = dx * dx + dy * dy
+        if denom <= 1e-9:
+            return math.hypot(px - ax, py - ay), 0.0
+        t = ((px - ax) * dx + (py - ay) * dy) / denom
+        t = max(0.0, min(1.0, t))
+        closest_x = ax + t * dx
+        closest_y = ay + t * dy
+        return math.hypot(px - closest_x, py - closest_y), t
+
+    def _approach_path_curvature(self, center_idx: int) -> float:
+        if len(self.waypoints) < 3:
+            return 0.0
+        start_idx = max(1, min(center_idx, len(self.waypoints) - 2))
+        end_idx = min(len(self.waypoints) - 2, start_idx + 3)
+        max_turn = 0.0
+        for idx in range(start_idx, end_idx + 1):
+            prev = self.waypoints[idx - 1]
+            curr = self.waypoints[idx]
+            nxt = self.waypoints[idx + 1]
+            yaw_in = math.atan2(curr[1] - prev[1], curr[0] - prev[0])
+            yaw_out = math.atan2(nxt[1] - curr[1], nxt[0] - curr[0])
+            max_turn = max(max_turn, abs(self._wrap_to_pi(yaw_out - yaw_in)))
+        return max_turn
 
     def _segment_gear_for_target(self, target_idx: int) -> str:
         if not self.waypoints:
