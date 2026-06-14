@@ -82,6 +82,17 @@ PREVIEW_STEER_RATE = math.radians(240.0)
 SPATIAL_INDEX_CELL_SIZE = 4.0
 CLEARANCE_QUERY_RADIUS = 8.0
 RISK_FIELD_SIGMA = 1.0
+GUIDED_DISTANCE_EPS = 0.25
+GUIDED_ENTRY_CLEARANCE_COST_WEIGHT = 0.08
+GUIDED_RISK_COST_WEIGHT = 0.05
+GUIDED_CLEARANCE_COST_WEIGHT = 0.02
+GUIDED_NEAR_LINE_COST_WEIGHT = 0.04
+GUIDED_NEAR_LINE_THRESHOLD = 1.10
+GUIDED_FAST_APPROACH_SPEED = 3.30
+GUIDED_FAST_APPROACH_CLEARANCE = 1.45
+GUIDED_FAST_APPROACH_STEER = math.radians(14.0)
+GUIDED_TERMINAL_STOP_DISTANCE = 0.24
+GUIDED_TERMINAL_DEEP_ENTRY_SPEED = 0.42
 POSE_Q_SIGMA = 5.0
 POSE_Q_FAR = (1.0, 1.1, 0.35)
 POSE_Q_NEAR = (1.0, 3.0, 7.0)
@@ -133,6 +144,7 @@ class PlannerSkeleton:
     final_eval_logged: bool = False
     planning_fail_reason: Optional[str] = None
     guided_blocked_grid_cache: Optional[Tuple[int, int, float, List[List[bool]]]] = None
+    guided_distance_field_cache: Optional[Tuple[int, int, float, List[List[float]]]] = None
     obstacle_rect_cache: Optional[List[Tuple[float, float, float, float]]] = None
     line_rect_cache: Optional[Dict[float, List[Tuple[float, float, float, float]]]] = None
     collision_rect_cache: Optional[List[Tuple[float, float, float, float]]] = None
@@ -185,6 +197,7 @@ class PlannerSkeleton:
         self.final_eval_logged = False
         self.planning_fail_reason = None
         self.guided_blocked_grid_cache = None
+        self.guided_distance_field_cache = None
         self.obstacle_rect_cache = None
         self.line_rect_cache = None
         self.collision_rect_cache = None
@@ -547,11 +560,18 @@ class PlannerSkeleton:
         final_wp = self.waypoints[-1]
         final_dist = math.hypot(final_wp[0] - x, final_wp[1] - y)
         final_yaw_error = abs(self._wrap_to_pi(final_wp[2] - yaw))
+        slot_payload = obs.get("target_slot") or []
+        target_slot_tuple: Optional[Tuple[float, float, float, float]] = None
+        slot_iou_proxy = 0.0
+        if len(slot_payload) == 4:
+            target_slot_tuple = tuple(float(v) for v in slot_payload)
+            slot_iou_proxy = self._slot_center_iou_proxy(target_slot_tuple, x, y)
+        expected = str((self.map_data or {}).get("expected_orientation") or "").lower()
         obstacle_dist = self._estimate_clearance((x, y), include_lines=True)
         self.min_obstacle_distance = min(self.min_obstacle_distance, obstacle_dist)
         collision_risk = obstacle_dist < 0.08
 
-        if final_dist < 0.55 and final_yaw_error < math.radians(14.0):
+        if final_dist < GUIDED_TERMINAL_STOP_DISTANCE and final_yaw_error < math.radians(14.0):
             self._log_evaluation(
                 parking_success=True,
                 fail_reason="none",
@@ -564,8 +584,9 @@ class PlannerSkeleton:
 
         self.current_yaw_for_progress = yaw
         self._advance_waypoint_index(x, y)
+        terminal_plan_active = self.waypoint_index >= self.hybrid_start_index
         if (
-            self.waypoint_index >= self.hybrid_start_index
+            terminal_plan_active
             and self.terminal_stuck_ticks >= TERMINAL_REPLAN_STUCK_TICKS
             and final_dist > 0.8
         ):
@@ -609,6 +630,32 @@ class PlannerSkeleton:
         )
 
         rule_speed = self._guided_target_speed(final_dist, final_yaw_error, steer, obstacle_dist)
+        if (
+            gear == "D"
+            and not terminal_plan_active
+            and obstacle_dist >= GUIDED_FAST_APPROACH_CLEARANCE
+            and final_dist > 8.0
+            and abs(steer) <= GUIDED_FAST_APPROACH_STEER
+        ):
+            rule_speed = max(rule_speed, min(GUIDED_FAST_APPROACH_SPEED, 2.35 + 0.035 * final_dist))
+        if (
+            terminal_plan_active
+            and final_dist > GUIDED_TERMINAL_STOP_DISTANCE + 0.18
+            and final_dist < 1.7
+            and final_yaw_error < math.radians(18.0)
+            and obstacle_dist > 0.35
+        ):
+            rule_speed = max(rule_speed, GUIDED_TERMINAL_DEEP_ENTRY_SPEED)
+        if (
+            terminal_plan_active
+            and not expected.startswith("rear")
+            and gear == "R"
+            and GUIDED_TERMINAL_STOP_DISTANCE + 0.20 < final_dist < 1.65
+            and final_yaw_error < math.radians(27.0)
+            and slot_iou_proxy > 0.66
+            and (abs(steer) < math.radians(31.0) or final_dist < 0.78)
+        ):
+            rule_speed = max(rule_speed, 0.38)
         target_speed = self.rl_speed.adjust_target_speed(
             rule_speed=rule_speed,
             final_dist=final_dist,
@@ -620,8 +667,9 @@ class PlannerSkeleton:
         force_full_accel = (
             gear == "D"
             and front_is_clear
-            and final_dist > 10.0
-            and abs(steer) < math.radians(8.0)
+            and final_dist > 8.0
+            and not terminal_plan_active
+            and abs(steer) < math.radians(10.0)
         )
         accel, brake = self._speed_command(
             speed=speed,
@@ -774,6 +822,22 @@ class PlannerSkeleton:
                 return semantic_plan
             if not expected.startswith("rear") and semantic_plan.preview_reason != "collision":
                 return semantic_plan
+            if semantic_plan.preview_reason == "collision" and not expected.startswith("rear"):
+                clearance_plan = self._build_entry_plan_for_sign(
+                    semantic_sign,
+                    semantic_sign,
+                    start,
+                    slot,
+                    target_pose,
+                    obs,
+                    use_distance_cost=True,
+                )
+                if clearance_plan is not None:
+                    plans.append(clearance_plan)
+                    if clearance_plan.preview_reason in {"success", "rear_turnaround"}:
+                        return clearance_plan
+                    if not expected.startswith("rear") and clearance_plan.preview_reason != "collision":
+                        return clearance_plan
         opposite_plan = self._build_entry_plan_for_sign(
             -semantic_sign,
             semantic_sign,
@@ -784,6 +848,18 @@ class PlannerSkeleton:
         )
         if opposite_plan is not None:
             plans.append(opposite_plan)
+            if opposite_plan.preview_reason == "collision" and not expected.startswith("rear"):
+                clearance_opposite_plan = self._build_entry_plan_for_sign(
+                    -semantic_sign,
+                    semantic_sign,
+                    start,
+                    slot,
+                    target_pose,
+                    obs,
+                    use_distance_cost=True,
+                )
+                if clearance_opposite_plan is not None:
+                    plans.append(clearance_opposite_plan)
         if not plans:
             return None
         non_collision_plans = [plan for plan in plans if plan.preview_reason != "collision"]
@@ -883,6 +959,7 @@ class PlannerSkeleton:
         start_xy: Tuple[float, float],
         candidates: List[Tuple[float, float, float]],
         target_pose: Tuple[float, float, float],
+        use_distance_cost: bool = False,
     ) -> Optional[Tuple[Tuple[float, float, float], List[Tuple[float, float]], float]]:
         if not candidates:
             return None
@@ -895,11 +972,25 @@ class PlannerSkeleton:
             ray = self._approach_ray_error((ax, ay), target_pose)
             lateral = self._target_axis_lateral_offset((ax, ay), target_pose)
             clearance = self._guided_clearance((ax, ay))
-            return dist + 0.4 * final_leg + 3.0 * ray + 0.8 * lateral + 0.8 / max(clearance, 0.25)
+            score = (
+                dist
+                + 0.4 * final_leg
+                + 3.0 * ray
+                + 0.8 * lateral
+                + 0.8 / max(clearance, 0.25)
+            )
+            if use_distance_cost:
+                field_clearance = self._guided_distance_at_point((ax, ay))
+                score += GUIDED_ENTRY_CLEARANCE_COST_WEIGHT / max(field_clearance, GUIDED_DISTANCE_EPS)
+            return score
 
         best: Optional[Tuple[Tuple[float, float, float], List[Tuple[float, float]], float]] = None
         for candidate in sorted(candidates, key=rough)[:GUIDED_CANDIDATE_EVAL_LIMIT]:
-            grid_path = self._guided_astar_path(start_xy, (candidate[0], candidate[1]))
+            grid_path = self._guided_astar_path(
+                start_xy,
+                (candidate[0], candidate[1]),
+                use_distance_cost=use_distance_cost,
+            )
             if not grid_path:
                 continue
             path_len = self._path_length(grid_path)
@@ -1007,6 +1098,7 @@ class PlannerSkeleton:
         self,
         start_xy: Tuple[float, float],
         goal_xy: Tuple[float, float],
+        use_distance_cost: bool = False,
     ) -> List[Tuple[float, float]]:
         if self.map_extent is None:
             return []
@@ -1015,6 +1107,11 @@ class PlannerSkeleton:
         cols = max(1, int(math.ceil((xmax - xmin) / grid_step)))
         rows = max(1, int(math.ceil((ymax - ymin) / grid_step)))
         blocked = self._cached_guided_blocked_grid(rows, cols, grid_step)
+        distance_field = (
+            self._cached_guided_distance_field(rows, cols, grid_step)
+            if use_distance_cost
+            else None
+        )
 
         def to_cell(point: Tuple[float, float]) -> Tuple[int, int]:
             px, py = point
@@ -1055,6 +1152,8 @@ class PlannerSkeleton:
                 if blocked[nxt[0]][nxt[1]]:
                     continue
                 new_cost = cost_so_far[current] + move_cost
+                if distance_field is not None:
+                    new_cost += self._guided_cell_risk_cost(nxt, distance_field)
                 if new_cost >= cost_so_far.get(nxt, float("inf")):
                     continue
                 cost_so_far[nxt] = new_cost
@@ -1142,12 +1241,14 @@ class PlannerSkeleton:
         slot: List[float],
         target_pose: Tuple[float, float, float],
         obs: Dict[str, Any],
+        use_distance_cost: bool = False,
     ) -> Optional[EntryPlan]:
         candidates = self._entry_candidates_for_sign(slot, target_pose[2], sign)
         best_plan = self._select_guided_best_plan(
             (start[0], start[1]),
             candidates,
             target_pose,
+            use_distance_cost=use_distance_cost,
         )
         if best_plan is None:
             return None
@@ -2135,6 +2236,112 @@ class PlannerSkeleton:
         cols = max(1, int(math.ceil((xmax - xmin) / grid_step)))
         rows = max(1, int(math.ceil((ymax - ymin) / grid_step)))
         self._cached_guided_blocked_grid(rows, cols, grid_step)
+        self._cached_guided_distance_field(rows, cols, grid_step)
+
+    def _cached_guided_distance_field(
+        self,
+        rows: int,
+        cols: int,
+        grid_step: float,
+    ) -> List[List[float]]:
+        if (
+            self.guided_distance_field_cache is None
+            or self.guided_distance_field_cache[0] != rows
+            or self.guided_distance_field_cache[1] != cols
+            or abs(self.guided_distance_field_cache[2] - grid_step) > 1e-9
+        ):
+            blocked = self._cached_guided_blocked_grid(rows, cols, grid_step)
+            field = self._guided_distance_field(blocked, grid_step)
+            self.guided_distance_field_cache = (rows, cols, grid_step, field)
+        return self.guided_distance_field_cache[3]
+
+    def _guided_distance_field(
+        self,
+        blocked: List[List[bool]],
+        grid_step: float,
+    ) -> List[List[float]]:
+        rows = len(blocked)
+        cols = len(blocked[0]) if rows else 0
+        dist = [[float("inf") for _ in range(cols)] for _ in range(rows)]
+        heap: List[Tuple[float, Tuple[int, int]]] = []
+        for row in range(rows):
+            for col in range(cols):
+                if blocked[row][col]:
+                    dist[row][col] = 0.0
+                    heapq.heappush(heap, (0.0, (row, col)))
+        if not heap:
+            return [[CLEARANCE_QUERY_RADIUS for _ in range(cols)] for _ in range(rows)]
+        motions = [
+            (-1, 0, grid_step),
+            (1, 0, grid_step),
+            (0, -1, grid_step),
+            (0, 1, grid_step),
+            (-1, -1, 1.414 * grid_step),
+            (-1, 1, 1.414 * grid_step),
+            (1, -1, 1.414 * grid_step),
+            (1, 1, 1.414 * grid_step),
+        ]
+        while heap:
+            current_dist, (row, col) = heapq.heappop(heap)
+            if current_dist > dist[row][col] + 1e-9:
+                continue
+            for dr, dc, step_cost in motions:
+                nxt = (row + dr, col + dc)
+                if not (0 <= nxt[0] < rows and 0 <= nxt[1] < cols):
+                    continue
+                new_dist = current_dist + step_cost
+                if new_dist >= dist[nxt[0]][nxt[1]]:
+                    continue
+                dist[nxt[0]][nxt[1]] = new_dist
+                heapq.heappush(heap, (new_dist, nxt))
+        return dist
+
+    def _guided_distance_at_cell(
+        self,
+        cell: Tuple[int, int],
+        distance_field: Optional[List[List[float]]] = None,
+    ) -> float:
+        if self.map_extent is None:
+            return CLEARANCE_QUERY_RADIUS
+        xmin, xmax, ymin, ymax = self.map_extent
+        grid_step = max(self.cell_size, GUIDED_GRID_STEP_MIN)
+        rows = max(1, int(math.ceil((ymax - ymin) / grid_step)))
+        cols = max(1, int(math.ceil((xmax - xmin) / grid_step)))
+        if distance_field is None:
+            distance_field = self._cached_guided_distance_field(rows, cols, grid_step)
+        row = max(0, min(rows - 1, cell[0]))
+        col = max(0, min(cols - 1, cell[1]))
+        value = distance_field[row][col]
+        if math.isinf(value):
+            return CLEARANCE_QUERY_RADIUS
+        return min(value, CLEARANCE_QUERY_RADIUS)
+
+    def _guided_distance_at_point(self, point: Tuple[float, float]) -> float:
+        if self.map_extent is None:
+            return CLEARANCE_QUERY_RADIUS
+        xmin, xmax, ymin, ymax = self.map_extent
+        grid_step = max(self.cell_size, GUIDED_GRID_STEP_MIN)
+        rows = max(1, int(math.ceil((ymax - ymin) / grid_step)))
+        cols = max(1, int(math.ceil((xmax - xmin) / grid_step)))
+        px, py = point
+        col = int((px - xmin) / grid_step)
+        row = int((ymax - py) / grid_step)
+        return self._guided_distance_at_cell((row, col))
+
+    def _guided_cell_risk_cost(
+        self,
+        cell: Tuple[int, int],
+        distance_field: List[List[float]],
+    ) -> float:
+        clearance = self._guided_distance_at_cell(cell, distance_field)
+        risk = math.exp(-(clearance * clearance) / (2.0 * RISK_FIELD_SIGMA * RISK_FIELD_SIGMA))
+        inverse_clearance = 1.0 / max(clearance, GUIDED_DISTANCE_EPS)
+        near_line = max(0.0, GUIDED_NEAR_LINE_THRESHOLD - clearance)
+        return (
+            GUIDED_RISK_COST_WEIGHT * risk
+            + GUIDED_CLEARANCE_COST_WEIGHT * inverse_clearance
+            + GUIDED_NEAR_LINE_COST_WEIGHT * near_line * near_line
+        )
 
     def _collision_rects(self) -> List[Tuple[float, float, float, float]]:
         if self.collision_rect_cache is None:
