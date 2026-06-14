@@ -44,7 +44,8 @@ FRONT_CLEAR_DISTANCE = 6.0
 FRONT_CLEAR_SPEED_BONUS = 0.75
 PARKING_ALIGN_DISTANCE = 6.0
 FRONT_APPROACH_DISTANCE = 5.0
-REAR_APPROACH_DISTANCE = 8.0
+REAR_APPROACH_DISTANCE = 5.0
+REAR_APPROACH_YAW_TOLERANCE = math.radians(30.0)
 FINAL_ALIGNMENT_DISTANCES = (3.4, 2.4, 1.45, 0.75, 0.35, 0.0)
 FINAL_ALIGN_CLEARANCE_MIN = 0.10
 PARKING_ENTRY_DISTANCES = (4.0, 3.5, 3.0, 2.5)
@@ -91,7 +92,10 @@ START_ALIGNMENT_DISTANCE = 2.2
 START_ALIGNMENT_MIN_SPEED = 0.35
 START_STEER_LIMIT = math.radians(14.0)
 PARKING_SUCCESS_IOU = 0.30
+PARKING_FINAL_STOP_IOU = 0.55
+PARKING_FINAL_STOP_DISTANCE = 0.85
 PARKING_STOP_SPEED = 0.20
+PARKING_MIN_ROLL_SPEED = 0.48
 PARKING_ORIENTATION_ALIGNMENT_THRESHOLD = math.cos(math.radians(48.0))
 
 
@@ -322,8 +326,13 @@ class PlannerSkeleton:
             and parking_iou >= PARKING_SUCCESS_IOU
             and orientation_ok
         )
+        planner_ready_to_stop = (
+            simulator_ready_to_stop
+            and parking_iou >= PARKING_FINAL_STOP_IOU
+            and final_dist <= PARKING_FINAL_STOP_DISTANCE
+        )
 
-        if simulator_ready_to_stop and speed <= PARKING_STOP_SPEED:
+        if planner_ready_to_stop and speed <= PARKING_STOP_SPEED:
             self._log_evaluation(
                 parking_success=True,
                 fail_reason="none",
@@ -343,14 +352,17 @@ class PlannerSkeleton:
                 f" min_obstacle_dist~{self.min_obstacle_distance:.2f}m"
             )
             return self._command(steer=0.0, accel=0.0, brake=1.0, gear="D")
-        if simulator_ready_to_stop:
-            return self._command(steer=0.0, accel=0.0, brake=1.0, gear="D")
 
         self._advance_waypoint_index(x, y)
         approach_remaining = self._approach_remaining(x, y)
         if len(slot) == 4:
+            rear_approach_yaw_ready = (
+                not self._is_rear_parking_mode()
+                or abs(self._wrap_to_pi(final_yaw - yaw)) <= REAR_APPROACH_YAW_TOLERANCE
+            )
             parking_entry_triggered = (
                 not self.parking_segment_ready
+                and rear_approach_yaw_ready
                 and (
                     approach_remaining <= PARKING_SEGMENT_TRIGGER_DISTANCE
                     or (
@@ -632,6 +644,12 @@ class PlannerSkeleton:
         if gear == "R":
             rule_speed = min(rule_speed, 0.55)
         if (
+            in_parking_mode
+            and not planner_ready_to_stop
+            and front_clearance >= OBSTACLE_STOP_DISTANCE
+        ):
+            rule_speed = max(rule_speed, PARKING_MIN_ROLL_SPEED)
+        if (
             not in_parking_mode
             and gear == "D"
             and speed < START_ALIGNMENT_MIN_SPEED
@@ -662,6 +680,7 @@ class PlannerSkeleton:
             target_speed=target_speed,
             front_is_clear=front_is_clear and final_dist > 3.0,
             force_full_accel=straight_clear_full_accel or approach_full_accel,
+            gentle_brake=in_parking_mode and not planner_ready_to_stop,
         )
         self._log_evaluation(
             parking_success=False,
@@ -1125,7 +1144,8 @@ class PlannerSkeleton:
                 start_xy,
                 (candidate[0], candidate[1]),
                 start_yaw=start_yaw,
-                goal_yaw=None,
+                goal_yaw=target_pose[2] if self._is_rear_parking_mode() else None,
+                goal_yaw_tolerance=REAR_APPROACH_YAW_TOLERANCE,
             )
             if not grid_path:
                 continue
@@ -1266,10 +1286,7 @@ class PlannerSkeleton:
         if not near_approach and not near_target:
             return False
 
-        if not self._is_rear_parking_mode():
-            selected = self._front_direct_parking_segment(x, y, target_pose)
-        else:
-            selected = self._select_parking_segment(x, y, target_pose)
+        selected = self._front_direct_parking_segment(x, y, target_pose)
         if selected is None:
             # Parking entry candidates would collide or leave the map; keep
             # following the A* approach path and retry from a better pose.
@@ -1544,6 +1561,7 @@ class PlannerSkeleton:
         goal_xy: Tuple[float, float],
         start_yaw: Optional[float] = None,
         goal_yaw: Optional[float] = None,
+        goal_yaw_tolerance: float = math.pi / 4.0,
     ) -> List[Tuple[float, float]]:
         if self.map_extent is None:
             return []
@@ -1599,7 +1617,11 @@ class PlannerSkeleton:
         while open_heap:
             _, _, current = heapq.heappop(open_heap)
             expansions += 1
-            if (current[0], current[1]) == goal and self._goal_heading_ok(current[2], goal_heading):
+            if (current[0], current[1]) == goal and self._goal_heading_ok(
+                current[2],
+                goal_heading,
+                tolerance=goal_yaw_tolerance,
+            ):
                 goal_state = current
                 break
             if expansions > max_expansions:
@@ -1653,10 +1675,16 @@ class PlannerSkeleton:
         diff = abs(a - b) % 8
         return min(diff, 8 - diff)
 
-    def _goal_heading_ok(self, heading: int, goal_heading: Optional[int]) -> bool:
+    def _goal_heading_ok(
+        self,
+        heading: int,
+        goal_heading: Optional[int],
+        tolerance: float = math.pi / 4.0,
+    ) -> bool:
         if goal_heading is None:
             return True
-        return self._heading_index_distance(heading, goal_heading) <= 1
+        heading_error = self._heading_index_distance(heading, goal_heading) * (math.pi / 4.0)
+        return heading_error <= tolerance + 1e-9
 
     def _warm_planning_caches(self, warm_pose_grid: bool = True) -> None:
         if self.map_extent is None:
@@ -2088,16 +2116,16 @@ class PlannerSkeleton:
         if final_dist < 6.0:
             target = 1.15
         if in_parking_mode:
-            target = min(target, 0.65)
+            target = min(target, 0.90)
         if final_dist < 2.2:
-            target = 0.28
+            target = 0.38
         if final_dist < 1.0:
-            target = 0.12
+            target = PARKING_MIN_ROLL_SPEED
         if yaw_error > math.radians(35.0) or abs(steer) > math.radians(25.0):
-            turn_cap = 2.40 if not in_parking_mode else 0.45
+            turn_cap = 2.40 if not in_parking_mode else 0.60
             target = min(target, turn_cap)
         if front_clearance < OBSTACLE_SLOW_DISTANCE:
-            target = min(target, 0.60 if not in_parking_mode else 0.45)
+            target = min(target, 0.60 if not in_parking_mode else 0.55)
         if front_clearance < OBSTACLE_STOP_DISTANCE:
             target = 0.0
         return target
@@ -2177,6 +2205,7 @@ class PlannerSkeleton:
         target_speed: float,
         front_is_clear: bool = False,
         force_full_accel: bool = False,
+        gentle_brake: bool = False,
     ) -> Tuple[float, float]:
         error = target_speed - speed
         if target_speed <= 0.05:
@@ -2189,6 +2218,8 @@ class PlannerSkeleton:
             accel_gain = 0.70 if front_is_clear else 0.55
             return min(accel_cap, accel_base + accel_gain * error), 0.0
         if error < -0.08:
+            if gentle_brake:
+                return 0.0, min(0.28, 0.08 + 0.18 * (-error))
             return 0.0, min(0.8, 0.25 + 0.35 * (-error))
         return 0.0, 0.0
 
