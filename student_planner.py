@@ -248,15 +248,12 @@ class PlannerSkeleton:
 
         simplified = self._simplify_path(grid_path, spacing=1.0)
         simplified = self._prepend_start_alignment(simplified, start)
-        if self._is_rear_parking_mode():
-            rear_points = self._rear_y_parking_points(
-                (approach_pose[0], approach_pose[1], target_pose[2]),
-                target_pose,
-            )
-            rear_points[0] = (approach_pose[0], approach_pose[1])
-            self.debug_parking_points = self._rear_second_debug_points(rear_points)
-        else:
-            self.debug_parking_points = None
+        t_points = self._rear_y_parking_points(
+            (approach_pose[0], approach_pose[1], target_pose[2]),
+            target_pose,
+        )
+        t_points[0] = (approach_pose[0], approach_pose[1])
+        self.debug_parking_points = self._rear_second_debug_points(t_points)
         points = simplified
         self.debug_astar_path = list(points)
         self.waypoints = self._points_to_waypoints(
@@ -1143,22 +1140,19 @@ class PlannerSkeleton:
         cx, cy = self._slot_center(slot)
         if self._is_rear_parking_mode():
             return self._rear_approach_candidates((cx, cy, target_yaw), slot)
-        return self._front_approach_candidates((cx, cy, target_yaw))
+        return self._front_approach_candidates((cx, cy, target_yaw), slot)
 
     def _front_approach_candidates(
         self,
         target_pose: Tuple[float, float, float],
+        slot: Optional[List[float]] = None,
     ) -> List[Tuple[float, float, float]]:
-        tx, ty, target_yaw = target_pose
-        desired: List[Tuple[float, float, float]] = []
-        for y_sign in self._open_vertical_approach_signs(tx, ty):
-            desired.append((tx, ty + y_sign * FRONT_APPROACH_DISTANCE, target_yaw))
-        return self._safe_approach_candidates(
-            desired,
-            target_yaw,
-            vehicle_margin=VEHICLE_RECT_MARGIN,
-            max_candidates=8,
-        )
+        target_yaw = target_pose[2]
+        candidates: List[Tuple[float, float, float]] = []
+        for side in (-1.0, 1.0):
+            p1, _, _ = self._rear_y_formula_points(target_pose, lateral_side=side, slot=slot)
+            candidates.append((p1[0], p1[1], target_yaw))
+        return candidates
 
     def _reverse_start_pose(
         self,
@@ -1556,7 +1550,7 @@ class PlannerSkeleton:
                 return True
             selected = self._rear_reverse_parking_segment(x, y, target_pose)
         else:
-            selected = self._front_direct_parking_segment(x, y, target_pose)
+            selected = self._front_t_parking_segment(x, y, target_pose)
         if selected is None:
             # Parking entry candidates would collide or leave the map; keep
             # following the A* approach path and retry from a better pose.
@@ -1640,16 +1634,18 @@ class PlannerSkeleton:
         points.append((tx, ty))
         return points, self._path_length(points)
 
-    def _front_direct_parking_segment(
+    def _front_t_parking_segment(
         self,
         x: float,
         y: float,
         target_pose: Tuple[float, float, float],
     ) -> Tuple[List[Tuple[float, float]], float]:
         tx, ty, _ = target_pose
-        points = [(x, y)]
-        if math.hypot(tx - x, ty - y) > 1.2:
-            points.append((0.5 * (x + tx), 0.5 * (y + ty)))
+        sequence = self._rear_y_parking_points((x, y, target_pose[2]), target_pose)
+        point3 = sequence[2]
+        points: List[Tuple[float, float]] = [(x, y)]
+        if math.hypot(point3[0] - x, point3[1] - y) > 0.45:
+            points.append(point3)
         points.append((tx, ty))
         return points, self._path_length(points)
 
