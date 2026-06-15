@@ -996,10 +996,19 @@ class PlannerSkeleton:
     def _expected_parking_mode(self, obs: Optional[Dict[str, Any]] = None) -> str:
         expected = self._find_parking_mode_text(obs)
         if "rear" in expected:
-            return "rear_in"
+            return self._sim_orientation_to_internal_mode("rear_in")
         if "front" in expected:
+            return self._sim_orientation_to_internal_mode("front_in")
+        return self._sim_orientation_to_internal_mode("front_in")
+
+    def _sim_orientation_to_internal_mode(self, expected: str) -> str:
+        # The simulator's front/rear labels are opposite to the convention used
+        # by the current student planner, so flip the signal once at input time.
+        if expected == "rear_in":
             return "front_in"
-        return "front_in"
+        if expected == "front_in":
+            return "rear_in"
+        return expected
 
     def _find_parking_mode_text(self, obs: Optional[Dict[str, Any]] = None) -> str:
         keys = (
