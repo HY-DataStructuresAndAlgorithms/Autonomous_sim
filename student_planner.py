@@ -35,6 +35,7 @@ VEHICLE_FRONT_LENGTH = 1.6
 VEHICLE_REAR_LENGTH = 1.4
 VEHICLE_HALF_WIDTH = 0.5 * VEHICLE_WIDTH
 VEHICLE_RECT_MARGIN = 1.5
+APPROACH_DRIVING_VEHICLE_MARGIN = 0.5
 PARKING_VEHICLE_RECT_MARGIN = 0.05
 PLANNING_OBSTACLE_MARGIN = VEHICLE_RECT_MARGIN
 EXTRA_SAFETY_MARGIN = 0.0
@@ -44,9 +45,11 @@ FRONT_CLEAR_DISTANCE = 6.0
 FRONT_CLEAR_SPEED_BONUS = 0.75
 PARKING_ALIGN_DISTANCE = 6.0
 FRONT_APPROACH_DISTANCE = 5.0
+FRONT_APPROACH_REACHED_TOLERANCE = 1.0
 REAR_APPROACH_DISTANCE = 2.0
 REAR_Y_TRIANGLE_HEIGHT = 7.0
 REAR_Y_TRIANGLE_HALF_WIDTH = 4.2
+REAR_Y_POINT2_EXTRA_WIDTH = 2.0
 REAR_Y_POINT1_VERTICAL_PULL = 2.0
 REAR_APPROACH_YAW_TOLERANCE = math.radians(30.0)
 REAR_REVERSE_START_TOLERANCE = 1.0
@@ -56,12 +59,16 @@ REAR_ALIGN_YAW_TOLERANCE = math.radians(8.0)
 REAR_ALIGN_SPEED = 0.45
 REAR_REVERSE_SPEED = 0.34
 REAR_REVERSE_FINAL_SPEED = 0.22
+REAR_REVERSE_MIN_SPEED = 0.30
 REAR_STEER_RATE_LIMIT = math.radians(7.0)
 PARKING_SEGMENT_TRIGGER_DISTANCE = 6.00
 APPROACH_CRUISE_SPEED = 5.30
 APPROACH_LOOKAHEAD_WINDOW = 18
 APPROACH_CURVATURE_SLOW_ANGLE = math.radians(32.0)
 APPROACH_CURVATURE_SLOW_SPEED = 1.35
+APPROACH_RECOVERY_MIN_SPEED = 2.20
+APPROACH_ON_PATH_MARGIN = 0.50
+APPROACH_PATH_DEVIATION_SPEED_DISTANCE = 1.20
 APPROACH_STUCK_SECONDS = 3.0
 APPROACH_STUCK_MIN_DISTANCE = 2.0
 APPROACH_STUCK_FRONT_BLOCKED = 1.20
@@ -69,7 +76,8 @@ APPROACH_STUCK_REVERSE_DISTANCE = 1.80
 APPROACH_STUCK_REVERSE_STOP_CLEARANCE = 0.45
 APPROACH_STUCK_FORWARD_DISTANCE = 1.20
 APPROACH_STUCK_FORWARD_STOP_CLEARANCE = 0.45
-PARKING_PREPARE_STOP_SPEED = 0.20
+PARKING_PREPARE_FULL_STOP_SPEED = 0.03
+PARKING_PREPARE_BRAKE = 0.45
 PARKING_REVERSE_STOP_CLEARANCE = 0.45
 PARKING_STATE_APPROACH = "APPROACH_MODE"
 PARKING_STATE_PREPARE_STOP = "PREPARE_STOP"
@@ -92,6 +100,8 @@ PARKING_FINAL_STOP_IOU = 0.55
 PARKING_FINAL_STOP_DISTANCE = 0.85
 PARKING_STOP_SPEED = 0.20
 PARKING_MIN_ROLL_SPEED = 0.48
+SECOND_APPROACH_MIN_SPEED = 0.25
+PARKING_STRAIGHTEN_YAW_TOLERANCE = math.radians(3.0)
 PARKING_ORIENTATION_ALIGNMENT_THRESHOLD = math.cos(math.radians(48.0))
 
 
@@ -137,7 +147,9 @@ class PlannerSkeleton:
     debug_parking_points: Optional[List[Tuple[float, float]]] = None
     rear_second_p1: Optional[Tuple[float, float]] = None
     parking_mode: str = "front_in"
+    parking_maneuver: str = "front_in"
     rear_last_steer: float = 0.0
+    parking_prepare_full_stop_seen: bool = False
     approach_stuck_anchor: Optional[Tuple[float, float, float]] = None
     approach_recovery_start: Optional[Tuple[float, float]] = None
     approach_forward_recovery_start: Optional[Tuple[float, float]] = None
@@ -177,7 +189,9 @@ class PlannerSkeleton:
         self.debug_parking_points = None
         self.rear_second_p1 = None
         self.parking_mode = self._expected_parking_mode()
+        self.parking_maneuver = "front_in"
         self.rear_last_steer = 0.0
+        self.parking_prepare_full_stop_seen = False
         self.approach_stuck_anchor = None
         self.approach_recovery_start = None
         self.approach_forward_recovery_start = None
@@ -198,6 +212,7 @@ class PlannerSkeleton:
         self.debug_parking_points = None
         self.rear_second_p1 = None
         self.rear_last_steer = 0.0
+        self.parking_prepare_full_stop_seen = False
         self.approach_stuck_anchor = None
         self.approach_recovery_start = None
         self.approach_forward_recovery_start = None
@@ -216,6 +231,7 @@ class PlannerSkeleton:
 
         self.target_signature = tuple(round(float(v), 3) for v in slot)
         target_pose = self._target_pose(slot)
+        self.parking_maneuver = self._select_parking_maneuver(slot, target_pose)
         candidates = self._approach_candidates(slot, target_pose[2])
         best_plan = self._select_best_plan(
             (start[0], start[1]),
@@ -244,6 +260,7 @@ class PlannerSkeleton:
                 f" selected=({approach_pose[0]:.2f}, {approach_pose[1]:.2f})"
                 f" a_star_points={len(grid_path)} cost={cost:.2f}"
                 f" parking_mode={self.parking_mode}"
+                f" maneuver={self.parking_maneuver}"
             )
 
         simplified = self._simplify_path(grid_path, spacing=1.0)
@@ -269,6 +286,7 @@ class PlannerSkeleton:
             f" waypoints={len(self.waypoints)}"
             f" stage=approach_only"
             f" parking_mode={self.parking_mode}"
+            f" maneuver={self.parking_maneuver}"
             f" target=({target_pose[0]:.2f}, {target_pose[1]:.2f}, "
             f"yaw={math.degrees(target_pose[2]):.1f}deg)"
             f" min_obstacle_dist~{initial_clearance:.2f}m"
@@ -372,7 +390,7 @@ class PlannerSkeleton:
                     not self.parking_segment_ready
                     and rear_approach_yaw_ready
                     and (
-                        approach_remaining <= PARKING_SEGMENT_TRIGGER_DISTANCE
+                        approach_remaining <= FRONT_APPROACH_REACHED_TOLERANCE
                         or (
                             self.debug_approach_point is None
                             and final_dist <= PARKING_ALIGN_DISTANCE
@@ -382,6 +400,7 @@ class PlannerSkeleton:
             if parking_entry_triggered:
                 if self.parking_state == PARKING_STATE_APPROACH:
                     self.parking_state = PARKING_STATE_PREPARE_STOP
+                    self.parking_prepare_full_stop_seen = False
                     print(
                         "[algo] parking state: PREPARE_STOP"
                         f" mode={self.parking_mode}"
@@ -389,21 +408,48 @@ class PlannerSkeleton:
                         f" pos_error={final_dist:.2f}m"
                         f" speed={speed:.2f}m/s"
                     )
-                if speed > PARKING_PREPARE_STOP_SPEED:
-                    return self._command(steer=0.0, accel=0.0, brake=1.0, gear="D")
+                if not self.parking_prepare_full_stop_seen:
+                    if speed > PARKING_PREPARE_FULL_STOP_SPEED:
+                        return self._command(
+                            steer=0.0,
+                            accel=0.0,
+                            brake=PARKING_PREPARE_BRAKE,
+                            gear="D",
+                        )
+                    self.parking_prepare_full_stop_seen = True
+                    print(
+                        "[algo] parking state: full stop confirmed"
+                        f" speed={speed:.3f}m/s"
+                    )
+                    return self._command(
+                        steer=0.0,
+                        accel=0.0,
+                        brake=PARKING_PREPARE_BRAKE,
+                        gear="D",
+                    )
                 segment_ready = self._ensure_parking_segment(
                     x=x,
                     y=y,
                     target_pose=target_pose,
                 )
                 if not segment_ready:
-                    return self._command(steer=0.0, accel=0.0, brake=1.0, gear="D")
+                    return self._command(
+                        steer=0.0,
+                        accel=0.0,
+                        brake=PARKING_PREPARE_BRAKE,
+                        gear="D",
+                    )
             final_wp = self.waypoints[-1]
             approach_remaining = self._approach_remaining(x, y)
+        approach_reached_tolerance = (
+            REAR_REVERSE_START_TOLERANCE
+            if self._is_rear_parking_mode()
+            else FRONT_APPROACH_REACHED_TOLERANCE
+        )
         approach_pending = (
             self.debug_approach_point is not None
             and not self.parking_segment_ready
-            and approach_remaining > PARKING_SEGMENT_TRIGGER_DISTANCE
+            and approach_remaining > approach_reached_tolerance
         )
         approach_tracking = approach_pending and final_dist > 2.2
         in_parking_mode = (
@@ -450,6 +496,18 @@ class PlannerSkeleton:
             if approach_tracking
             else 0.0
         )
+        moving_to_approach = (
+            approach_tracking
+            and final_dist > 2.2
+            and gear == "D"
+        )
+        clearance_vehicle_margin = (
+            PARKING_VEHICLE_RECT_MARGIN
+            if in_parking_mode
+            else APPROACH_DRIVING_VEHICLE_MARGIN
+            if moving_to_approach
+            else VEHICLE_RECT_MARGIN
+        )
         forward_clearance = self._estimate_forward_clearance(
             x=x,
             y=y,
@@ -457,14 +515,7 @@ class PlannerSkeleton:
             reverse=False,
             steer=0.0,
             wheelbase=wheelbase,
-            vehicle_margin=(
-                PARKING_VEHICLE_RECT_MARGIN if in_parking_mode else VEHICLE_RECT_MARGIN
-            ),
-        )
-        moving_to_approach = (
-            approach_tracking
-            and final_dist > 2.2
-            and gear == "D"
+            vehicle_margin=clearance_vehicle_margin,
         )
         stuck_command = self._approach_stuck_recovery_command(
             obs=obs,
@@ -475,6 +526,7 @@ class PlannerSkeleton:
             wheelbase=wheelbase,
             moving_to_approach=moving_to_approach,
             front_clearance=forward_clearance,
+            vehicle_margin=clearance_vehicle_margin,
         )
         if stuck_command is not None:
             return stuck_command
@@ -528,6 +580,8 @@ class PlannerSkeleton:
             max_steer=max_steer,
             reverse=(gear == "R"),
         )
+        if in_parking_mode and final_yaw_error <= PARKING_STRAIGHTEN_YAW_TOLERANCE:
+            steer = 0.0
         if (
             not in_parking_mode
             and gear == "D"
@@ -542,9 +596,7 @@ class PlannerSkeleton:
             reverse=(gear == "R"),
             steer=steer,
             wheelbase=wheelbase,
-            vehicle_margin=(
-                PARKING_VEHICLE_RECT_MARGIN if in_parking_mode else VEHICLE_RECT_MARGIN
-            ),
+            vehicle_margin=clearance_vehicle_margin,
         )
         collision_risk = front_clearance < OBSTACLE_STOP_DISTANCE
         if collision_risk and final_dist > 1.0:
@@ -569,19 +621,41 @@ class PlannerSkeleton:
             steer,
             front_clearance,
         )
+        approach_deviation = 0.0
+        approach_on_path = False
+        approach_recovering_from_deviation = False
         if moving_to_approach:
+            approach_deviation = self._approach_path_deviation(x, y)
+            approach_on_path = approach_deviation <= APPROACH_ON_PATH_MARGIN
             rule_speed = self._approach_speed(
                 base_speed=rule_speed,
                 approach_remaining=approach_remaining,
-                steer_abs=abs(steer),
+                steer_abs=0.0 if approach_on_path else abs(steer),
                 front_clearance=front_clearance,
             )
-            if approach_curvature >= APPROACH_CURVATURE_SLOW_ANGLE:
+            if (
+                not approach_on_path
+                and approach_curvature >= APPROACH_CURVATURE_SLOW_ANGLE
+            ):
                 rule_speed = min(rule_speed, APPROACH_CURVATURE_SLOW_SPEED)
+            if (
+                approach_deviation >= APPROACH_PATH_DEVIATION_SPEED_DISTANCE
+                and front_clearance >= OBSTACLE_SLOW_DISTANCE
+            ):
+                approach_recovering_from_deviation = True
+                rule_speed = max(rule_speed, APPROACH_RECOVERY_MIN_SPEED)
         if gear == "R":
             rule_speed = min(rule_speed, 0.55)
         if (
+            second_approach_mode
+            and gear == "D"
+            and front_clearance >= OBSTACLE_STOP_DISTANCE
+        ):
+            rule_speed = max(rule_speed, SECOND_APPROACH_MIN_SPEED)
+            rule_speed = min(rule_speed, 3.0)
+        if (
             in_parking_mode
+            and not second_approach_mode
             and not planner_ready_to_stop
             and front_clearance >= OBSTACLE_STOP_DISTANCE
         ):
@@ -589,6 +663,8 @@ class PlannerSkeleton:
         if (
             not in_parking_mode
             and gear == "D"
+            and not approach_recovering_from_deviation
+            and not approach_on_path
             and speed < START_ALIGNMENT_MIN_SPEED
             and abs(steer) > math.radians(8.0)
         ):
@@ -612,11 +688,16 @@ class PlannerSkeleton:
             and front_clearance >= 2.0
             and abs(steer) < math.radians(18.0)
         )
+        approach_recovery_accel = (
+            moving_to_approach
+            and approach_recovering_from_deviation
+            and front_clearance >= 2.0
+        )
         accel, brake = self._speed_command(
             speed=speed,
             target_speed=target_speed,
             front_is_clear=front_is_clear and final_dist > 3.0,
-            force_full_accel=straight_clear_full_accel or approach_full_accel,
+            force_full_accel=straight_clear_full_accel or approach_full_accel or approach_recovery_accel,
             gentle_brake=in_parking_mode and not planner_ready_to_stop,
         )
         self._log_evaluation(
@@ -641,13 +722,18 @@ class PlannerSkeleton:
                 f" orientation={actual_orientation}/{self.parking_mode}"
                 f" parking_state={self.parking_state}"
                 f" parking_mode={self.parking_mode}"
+                f" maneuver={self.parking_maneuver}"
                 f" tracking_yaw_error={math.degrees(tracking_yaw_error):.1f}deg"
                 f" final_yaw_error={math.degrees(final_yaw_error):.1f}deg"
                 f" min_obstacle_dist~{self.min_obstacle_distance:.2f}m"
                 f" front_clearance~{front_clearance:.2f}m"
+                f" vehicle_margin={clearance_vehicle_margin:.2f}m"
                 f" gear={gear}"
                 f" lookahead={lookahead:.2f}m"
                 f" path_curvature={math.degrees(approach_curvature):.1f}deg"
+                f" path_deviation={approach_deviation:.2f}m"
+                f" on_path={approach_on_path}"
+                f" recovery_accel={approach_recovery_accel}"
                 f" rule_speed={rule_speed:.2f}m/s"
                 f" speed={target_speed:.2f}m/s"
                 f" rl={'ON' if self.rl_speed.enabled else 'OFF'}"
@@ -726,6 +812,7 @@ class PlannerSkeleton:
         wheelbase: float,
         moving_to_approach: bool,
         front_clearance: float,
+        vehicle_margin: float,
     ) -> Optional[Dict[str, Any]]:
         if self.approach_forward_recovery_start is not None:
             forward_distance = math.hypot(
@@ -739,7 +826,7 @@ class PlannerSkeleton:
                 reverse=False,
                 steer=0.0,
                 wheelbase=wheelbase,
-                vehicle_margin=VEHICLE_RECT_MARGIN,
+                vehicle_margin=vehicle_margin,
             )
             if (
                 forward_distance >= APPROACH_STUCK_FORWARD_DISTANCE
@@ -768,7 +855,7 @@ class PlannerSkeleton:
                 reverse=True,
                 steer=0.0,
                 wheelbase=wheelbase,
-                vehicle_margin=VEHICLE_RECT_MARGIN,
+                vehicle_margin=vehicle_margin,
             )
             if reverse_clearance < APPROACH_STUCK_REVERSE_STOP_CLEARANCE:
                 if front_clearance > APPROACH_STUCK_FORWARD_STOP_CLEARANCE:
@@ -828,7 +915,7 @@ class PlannerSkeleton:
                 reverse=True,
                 steer=0.0,
                 wheelbase=wheelbase,
-                vehicle_margin=VEHICLE_RECT_MARGIN,
+                vehicle_margin=vehicle_margin,
             )
             if rear_clearance < APPROACH_STUCK_REVERSE_STOP_CLEARANCE:
                 self.approach_forward_recovery_start = (x, y)
@@ -946,6 +1033,9 @@ class PlannerSkeleton:
             reverse=True,
         )
         steer = self._limit_rear_steer(steer, dt, max_steer)
+        if point3_reached and final_yaw_error <= PARKING_STRAIGHTEN_YAW_TOLERANCE:
+            steer = 0.0
+            self.rear_last_steer = 0.0
         reverse_clearance = self._estimate_forward_clearance(
             x=x,
             y=y,
@@ -956,6 +1046,7 @@ class PlannerSkeleton:
             vehicle_margin=PARKING_VEHICLE_RECT_MARGIN,
         )
         target_speed = REAR_REVERSE_FINAL_SPEED if final_dist < 1.4 else REAR_REVERSE_SPEED
+        target_speed = max(target_speed, REAR_REVERSE_MIN_SPEED)
         if point3_reached:
             target_speed = max(target_speed, PARKING_MIN_ROLL_SPEED)
         if reverse_clearance < PARKING_REVERSE_STOP_CLEARANCE:
@@ -965,6 +1056,7 @@ class PlannerSkeleton:
             target_speed=target_speed,
             front_is_clear=False,
             gentle_brake=True,
+            accel_deadband=0.03,
         )
         if current_time - self.last_log_time > 2.0:
             self.last_log_time = current_time
@@ -990,25 +1082,16 @@ class PlannerSkeleton:
 
     def _target_pose(self, slot: List[float]) -> Tuple[float, float, float]:
         cx, cy = self._slot_center(slot)
-        yaw = -math.pi / 2.0 if self._is_rear_parking_mode() else math.pi / 2.0
+        yaw = -math.pi / 2.0 if self.parking_mode.lower().startswith("rear") else math.pi / 2.0
         return cx, cy, yaw
 
     def _expected_parking_mode(self, obs: Optional[Dict[str, Any]] = None) -> str:
         expected = self._find_parking_mode_text(obs)
         if "rear" in expected:
-            return self._sim_orientation_to_internal_mode("rear_in")
-        if "front" in expected:
-            return self._sim_orientation_to_internal_mode("front_in")
-        return self._sim_orientation_to_internal_mode("front_in")
-
-    def _sim_orientation_to_internal_mode(self, expected: str) -> str:
-        # The simulator's front/rear labels are opposite to the convention used
-        # by the current student planner, so flip the signal once at input time.
-        if expected == "rear_in":
-            return "front_in"
-        if expected == "front_in":
             return "rear_in"
-        return expected
+        if "front" in expected:
+            return "front_in"
+        return "front_in"
 
     def _find_parking_mode_text(self, obs: Optional[Dict[str, Any]] = None) -> str:
         keys = (
@@ -1038,7 +1121,20 @@ class PlannerSkeleton:
         return ""
 
     def _is_rear_parking_mode(self) -> bool:
-        return self.parking_mode.lower().startswith("rear")
+        return self.parking_maneuver.lower().startswith("rear")
+
+    def _select_parking_maneuver(
+        self,
+        slot: List[float],
+        target_pose: Tuple[float, float, float],
+    ) -> str:
+        open_sign = self._rear_open_side_sign(target_pose, slot=slot)
+        desired_front_sign = 1.0 if self.parking_mode.lower().startswith("front") else -1.0
+        # Forward parking enters from the open side toward the slot center, so
+        # the final front direction is opposite to the opening direction.
+        if desired_front_sign * open_sign < 0.0:
+            return "front_in"
+        return "rear_in"
 
     def _slot_center(self, slot: List[float]) -> Tuple[float, float]:
         return (
@@ -1325,7 +1421,7 @@ class PlannerSkeleton:
             base_y - open_sign * REAR_Y_POINT1_VERTICAL_PULL,
         )
         p2 = (
-            tx - lateral_side * REAR_Y_TRIANGLE_HALF_WIDTH,
+            tx - lateral_side * (REAR_Y_TRIANGLE_HALF_WIDTH + REAR_Y_POINT2_EXTRA_WIDTH),
             base_y,
         )
         return [
@@ -1499,7 +1595,6 @@ class PlannerSkeleton:
     ) -> Optional[Tuple[Tuple[float, float, float], List[Tuple[float, float]], float]]:
         best: Optional[Tuple[Tuple[float, float, float], List[Tuple[float, float]], float]] = None
         started_at = time.perf_counter()
-        rear_mode = self._is_rear_parking_mode()
         for candidate in candidates:
             goal_xy = (candidate[0], candidate[1])
             grid_path = self._astar_path(
@@ -1508,10 +1603,6 @@ class PlannerSkeleton:
                 start_yaw=start_yaw,
                 goal_yaw=None,
             )
-            if not grid_path:
-                grid_path = self._fast_approach_path(start_xy, goal_xy)
-                if grid_path and rear_mode:
-                    print("[algo] A* failed; using fast approach fallback")
             if not grid_path:
                 continue
             path_len = self._path_length(grid_path)
@@ -1651,6 +1742,7 @@ class PlannerSkeleton:
         print(
             "[algo] parking segment ready:"
             f" mode={self.parking_mode}"
+            f" maneuver={self.parking_maneuver}"
             f" waypoints={len(self.waypoints)}"
             f" cost={segment_cost:.2f}"
             f" target=({target_pose[0]:.2f}, {target_pose[1]:.2f}, "
@@ -1678,7 +1770,9 @@ class PlannerSkeleton:
         if len(sequence) != 3:
             return None
         sequence[0] = p1
-        points: List[Tuple[float, float]] = [p1, sequence[1]]
+        # The vehicle may stop slightly past the precomputed 2-1 point.
+        # Track the second leg from the actual stopped pose, not from stale p1.
+        points: List[Tuple[float, float]] = [(x, y), sequence[1]]
         if not self._sampled_path_is_clear(
             points,
             vehicle_margin=PARKING_VEHICLE_RECT_MARGIN,
@@ -2218,6 +2312,22 @@ class PlannerSkeleton:
                 best_idx = idx + 1 if seg_t > 0.65 else idx
         return max(start_idx, min(best_idx, len(self.waypoints) - 1))
 
+    def _approach_path_deviation(self, x: float, y: float) -> float:
+        if not self.waypoints:
+            return 0.0
+        start_idx = max(0, min(self.waypoint_index, len(self.waypoints) - 1))
+        end_idx = min(len(self.waypoints) - 1, start_idx + APPROACH_LOOKAHEAD_WINDOW)
+        if start_idx >= end_idx:
+            wp = self.waypoints[start_idx]
+            return math.hypot(wp[0] - x, wp[1] - y)
+        best_dist = float("inf")
+        for idx in range(start_idx, end_idx):
+            ax, ay = self.waypoints[idx][0], self.waypoints[idx][1]
+            bx, by = self.waypoints[idx + 1][0], self.waypoints[idx + 1][1]
+            seg_dist, _ = self._approach_point_to_segment_distance(x, y, ax, ay, bx, by)
+            best_dist = min(best_dist, seg_dist)
+        return best_dist
+
     def _approach_point_to_segment_distance(
         self,
         px: float,
@@ -2431,13 +2541,14 @@ class PlannerSkeleton:
         front_is_clear: bool = False,
         force_full_accel: bool = False,
         gentle_brake: bool = False,
+        accel_deadband: float = 0.15,
     ) -> Tuple[float, float]:
         error = target_speed - speed
         if target_speed <= 0.05:
             return 0.0, 1.0
         if force_full_accel and error > 0.05:
             return 1.0, 0.0
-        if error > 0.15:
+        if error > accel_deadband:
             accel_cap = 1.0 if front_is_clear else 0.9
             accel_base = 0.70 if front_is_clear else 0.55
             accel_gain = 0.70 if front_is_clear else 0.55
