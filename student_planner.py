@@ -725,7 +725,13 @@ class PlannerSkeleton:
         target_wp = self.waypoints[target_idx]
         gear = target_wp[3]
 
-        if gear != self.last_command_gear and speed > 0.12:
+        allow_creep_gear_change = (
+            terminal_plan_active
+            and target_slot_tuple is not None
+            and PARKING_CREEP_IOU <= slot_iou < PARKING_STOP_IOU
+            and obstacle_dist > 0.05
+        )
+        if gear != self.last_command_gear and speed > 0.12 and not allow_creep_gear_change:
             return {
                 "steer": 0.0,
                 "accel": 0.0,
@@ -811,8 +817,8 @@ class PlannerSkeleton:
             front_is_clear=front_is_clear,
             force_full_accel=force_full_accel,
         )
-        if anti_early_success_guard and speed < 0.22:
-            accel = max(accel, 0.18)
+        if anti_early_success_guard and speed < 0.28:
+            accel = max(accel, 0.35)
             brake = 0.0
         self._log_evaluation(
             parking_success=False,
