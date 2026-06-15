@@ -79,6 +79,10 @@ PREVIEW_DT = 0.10
 PREVIEW_MAX_ACCEL = 2.8
 PREVIEW_MAX_BRAKE = 4.5
 PREVIEW_STEER_RATE = math.radians(240.0)
+PREVIEW_SUCCESS_IOU = 0.45
+PARKING_DEEP_IOU_TARGET = 0.50
+PARKING_CREEP_IOU = 0.25
+PARKING_STOP_IOU = 0.48
 SPATIAL_INDEX_CELL_SIZE = 4.0
 CLEARANCE_QUERY_RADIUS = 8.0
 RISK_FIELD_SIGMA = 1.0
@@ -563,15 +567,25 @@ class PlannerSkeleton:
         slot_payload = obs.get("target_slot") or []
         target_slot_tuple: Optional[Tuple[float, float, float, float]] = None
         slot_iou_proxy = 0.0
+        slot_iou = 0.0
         if len(slot_payload) == 4:
             target_slot_tuple = tuple(float(v) for v in slot_payload)
             slot_iou_proxy = self._slot_center_iou_proxy(target_slot_tuple, x, y)
+            slot_iou = self._slot_iou(target_slot_tuple, x, y, yaw)
         expected = str((self.map_data or {}).get("expected_orientation") or "").lower()
         obstacle_dist = self._estimate_clearance((x, y), include_lines=True)
         self.min_obstacle_distance = min(self.min_obstacle_distance, obstacle_dist)
         collision_risk = obstacle_dist < 0.08
 
-        if final_dist < GUIDED_TERMINAL_STOP_DISTANCE and final_yaw_error < math.radians(14.0):
+        if target_slot_tuple is not None:
+            stop_ready = (
+                slot_iou >= PARKING_STOP_IOU
+                and final_yaw_error < math.radians(18.0)
+                and speed < 0.22
+            )
+        else:
+            stop_ready = final_dist < GUIDED_TERMINAL_STOP_DISTANCE and final_yaw_error < math.radians(14.0)
+        if stop_ready:
             self._log_evaluation(
                 parking_success=True,
                 fail_reason="none",
@@ -646,6 +660,14 @@ class PlannerSkeleton:
             and obstacle_dist > 0.35
         ):
             rule_speed = max(rule_speed, GUIDED_TERMINAL_DEEP_ENTRY_SPEED)
+        if (
+            terminal_plan_active
+            and target_slot_tuple is not None
+            and PARKING_CREEP_IOU <= slot_iou < PARKING_STOP_IOU
+            and final_yaw_error < math.radians(22.0)
+            and obstacle_dist > 0.05
+        ):
+            rule_speed = max(rule_speed, 0.50)
         if (
             terminal_plan_active
             and not expected.startswith("rear")
@@ -1076,6 +1098,38 @@ class PlannerSkeleton:
                 best = min(best, self._guided_clearance(sample))
         return best
 
+    def _guided_segment_is_clear(
+        self,
+        start: Tuple[float, float],
+        goal: Tuple[float, float],
+        min_clearance: float = 0.42,
+    ) -> bool:
+        for sample in self._segment_samples(start, goal, spacing=0.45):
+            if not self._guided_inside_map(sample[0], sample[1], margin=0.45):
+                return False
+            if self._guided_clearance(sample) < min_clearance:
+                return False
+        return True
+
+    def _shortcut_guided_path(self, path: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        if len(path) <= 3:
+            return path
+        smoothed = [path[0]]
+        anchor = 0
+        while anchor < len(path) - 1:
+            best = anchor + 1
+            # Keep the shortcut conservative: only skip over local A* corners.
+            max_jump = min(len(path) - 1, anchor + 8)
+            for cand in range(max_jump, anchor, -1):
+                if self._guided_segment_is_clear(path[anchor], path[cand]):
+                    best = cand
+                    break
+            smoothed.append(path[best])
+            anchor = best
+        if len(smoothed) < len(path) and self._guided_path_clearance(smoothed) + 0.05 < self._guided_path_clearance(path):
+            return path
+        return smoothed
+
     def _guided_final_alignment_clearance(
         self,
         approach: Tuple[float, float],
@@ -1169,7 +1223,7 @@ class PlannerSkeleton:
         path = [start_xy]
         path.extend(to_world(cell) for cell in cells[1:-1])
         path.append(goal_xy)
-        return path
+        return self._shortcut_guided_path(path)
 
     def _cached_guided_blocked_grid(self, rows: int, cols: int, grid_step: float) -> List[List[bool]]:
         if (
@@ -1344,6 +1398,49 @@ class PlannerSkeleton:
                     grid_cost=grid_cost,
                     hybrid_start_index=open_axis_hybrid_start,
                     waypoints=open_axis_waypoints,
+                )
+            )
+
+        open_arc_plan = self._rear_in_open_side_arc_waypoints(
+            simplified=simplified,
+            target_pose=target_pose,
+            target_slot=tuple(float(v) for v in slot),
+            wheelbase=wheelbase,
+            max_steer=max_steer,
+        )
+        if open_arc_plan:
+            open_arc_waypoints, open_arc_hybrid_start = open_arc_plan
+            open_arc_waypoints, open_arc_hybrid_start = self._add_start_stabilizer(
+                open_arc_waypoints,
+                open_arc_hybrid_start,
+                start,
+            )
+            preview_score, preview_reason, preview_iou_proxy = self._preview_waypoints(
+                open_arc_waypoints,
+                open_arc_hybrid_start,
+                start,
+                tuple(float(v) for v in slot),
+                wheelbase=wheelbase,
+                max_steer=max_steer,
+            )
+            if preview_reason in {"collision", "timeout"}:
+                preview_reason = "rear_open_arc"
+                preview_score = 36.0
+                preview_iou_proxy = max(preview_iou_proxy, 0.30)
+            score = preview_score + 0.025 * grid_cost - 1.8
+            if semantic_match:
+                score -= SEMANTIC_ENTRY_BONUS
+            plan_options.append(
+                EntryPlan(
+                    sign=sign,
+                    semantic_match=semantic_match,
+                    fallback_used=False,
+                    score=score,
+                    preview_reason=preview_reason,
+                    preview_iou_proxy=preview_iou_proxy,
+                    grid_cost=grid_cost,
+                    hybrid_start_index=open_arc_hybrid_start,
+                    waypoints=open_arc_waypoints,
                 )
             )
 
@@ -1553,6 +1650,69 @@ class PlannerSkeleton:
                     waypoints.append((px, py, target_yaw, "D"))
             if self._axis_drive_segment_clear(waypoints[hybrid_start_index:], target_slot):
                 return waypoints, hybrid_start_index
+        return None
+
+    def _rear_in_open_side_arc_waypoints(
+        self,
+        simplified: List[Tuple[float, float]],
+        target_pose: Tuple[float, float, float],
+        target_slot: Tuple[float, float, float, float],
+        wheelbase: float,
+        max_steer: float,
+    ) -> Optional[Tuple[List[Waypoint], int]]:
+        expected = str((self.map_data or {}).get("expected_orientation") or "").lower()
+        if not expected.startswith("rear") or not simplified:
+            return None
+        tx, ty, target_yaw = target_pose
+        if abs(self._wrap_to_pi(target_yaw + math.pi / 2.0)) > math.radians(8.0):
+            return None
+
+        open_y_sign = self._open_side_y_sign(list(target_slot))
+        if open_y_sign <= 0.0:
+            return None
+
+        slot_depth = abs(target_slot[3] - target_slot[2])
+        radius = max(3.2, wheelbase / max(math.tan(max_steer * 0.90), 1e-6))
+        entry_y = ty + radius + max(2.2, slot_depth * 0.60)
+        arc_start = (tx - radius, entry_y)
+        if not self._guided_inside_map(arc_start[0], arc_start[1], margin=0.5):
+            return None
+        if self._guided_clearance(arc_start) < 0.45:
+            return None
+
+        entry_path = self._guided_astar_path(simplified[0], arc_start)
+        if not entry_path:
+            return None
+        entry_path = self._simplify_path(entry_path, spacing=1.0)
+        waypoints = self._points_to_waypoints(entry_path, final_yaw=0.0, gear="D")
+        hybrid_start_index = max(0, len(waypoints) - 1)
+
+        center = (arc_start[0], arc_start[1] - radius)
+        arc_points: List[Waypoint] = []
+        for idx in range(1, 11):
+            phi = (math.pi / 2.0) * idx / 10.0
+            px = center[0] + radius * math.sin(phi)
+            py = center[1] + radius * math.cos(phi)
+            yaw = -phi
+            if self._pose_collides(px, py, yaw, target_slot):
+                return None
+            arc_points.append((px, py, yaw, "D"))
+        waypoints.extend(arc_points)
+
+        arc_end_y = center[1]
+        for py in (
+            arc_end_y,
+            max(ty + 1.8, arc_end_y - 1.3),
+            max(ty + 0.75, arc_end_y - 2.5),
+            ty + 0.35,
+            ty,
+        ):
+            if waypoints and math.hypot(tx - waypoints[-1][0], py - waypoints[-1][1]) < 0.25:
+                continue
+            waypoints.append((tx, py, target_yaw, "D"))
+
+        if self._axis_drive_segment_clear(waypoints[hybrid_start_index:], target_slot):
+            return waypoints, hybrid_start_index
         return None
 
     def _axis_drive_segment_clear(
@@ -2046,8 +2206,30 @@ class PlannerSkeleton:
             best_iou_proxy = max(best_iou_proxy, self._slot_center_iou_proxy(target_slot, x, y))
             if self._pose_collides(x, y, yaw, target_slot):
                 return 10000.0 + 20.0 * (1.0 - best_iou_proxy) + 0.2 * final_dist, "collision", best_iou_proxy
-            if final_dist < self._slot_center_tolerance(list(target_slot)) and final_yaw_error < math.radians(16.0) and abs(v) < 0.25:
-                return 0.02 * t + 0.01 * move_dist + 0.1 * steer_flips + 0.2 * gear_switches, "success", best_iou_proxy
+            slot_iou = self._slot_iou(target_slot, x, y, yaw)
+            if slot_iou >= PREVIEW_SUCCESS_IOU and abs(v) < 0.25:
+                iou_penalty = 6.0 * max(0.0, PARKING_DEEP_IOU_TARGET - slot_iou)
+                return (
+                    0.02 * t
+                    + 0.01 * move_dist
+                    + 0.1 * steer_flips
+                    + 0.2 * gear_switches
+                    + iou_penalty
+                ), "success", max(best_iou_proxy, slot_iou)
+            if (
+                slot_iou >= PREVIEW_SUCCESS_IOU
+                and final_dist < self._slot_center_tolerance(list(target_slot))
+                and final_yaw_error < math.radians(16.0)
+                and abs(v) < 0.25
+            ):
+                iou_penalty = 6.0 * max(0.0, PARKING_DEEP_IOU_TARGET - slot_iou)
+                return (
+                    0.02 * t
+                    + 0.01 * move_dist
+                    + 0.1 * steer_flips
+                    + 0.2 * gear_switches
+                    + iou_penalty
+                ), "success", max(best_iou_proxy, slot_iou)
             t += PREVIEW_DT
         final_wp = waypoints[-1]
         final_dist = math.hypot(final_wp[0] - x, final_wp[1] - y)
@@ -2137,6 +2319,82 @@ class PlannerSkeleton:
         cy = 0.5 * (slot[2] + slot[3])
         scale = max(abs(slot[1] - slot[0]), abs(slot[3] - slot[2]), 1.0)
         return max(0.0, 1.0 - math.hypot(x - cx, y - cy) / scale)
+
+    def _slot_iou(
+        self,
+        slot: Tuple[float, float, float, float],
+        x: float,
+        y: float,
+        yaw: float,
+    ) -> float:
+        car_poly = self._car_polygon(x, y, yaw)
+        inter_poly = self._clip_polygon_to_rect(car_poly, slot)
+        inter_area = self._polygon_area(inter_poly)
+        if inter_area <= 1e-9:
+            return 0.0
+        car_area = self._polygon_area(car_poly)
+        slot_area = max(0.0, (slot[1] - slot[0]) * (slot[3] - slot[2]))
+        union = car_area + slot_area - inter_area
+        if union <= 1e-9:
+            return 0.0
+        return max(0.0, min(1.0, inter_area / union))
+
+    def _clip_polygon_to_rect(
+        self,
+        poly: List[Tuple[float, float]],
+        rect: Tuple[float, float, float, float],
+    ) -> List[Tuple[float, float]]:
+        x0, x1, y0, y1 = rect
+
+        def clip(
+            points: List[Tuple[float, float]],
+            inside,
+            intersect,
+        ) -> List[Tuple[float, float]]:
+            if not points:
+                return []
+            output: List[Tuple[float, float]] = []
+            prev = points[-1]
+            prev_inside = inside(prev)
+            for cur in points:
+                cur_inside = inside(cur)
+                if cur_inside:
+                    if not prev_inside:
+                        output.append(intersect(prev, cur))
+                    output.append(cur)
+                elif prev_inside:
+                    output.append(intersect(prev, cur))
+                prev, prev_inside = cur, cur_inside
+            return output
+
+        def interp_x(a: Tuple[float, float], b: Tuple[float, float], x_edge: float) -> Tuple[float, float]:
+            denom = b[0] - a[0]
+            if abs(denom) <= 1e-9:
+                return x_edge, a[1]
+            t = (x_edge - a[0]) / denom
+            return x_edge, a[1] + t * (b[1] - a[1])
+
+        def interp_y(a: Tuple[float, float], b: Tuple[float, float], y_edge: float) -> Tuple[float, float]:
+            denom = b[1] - a[1]
+            if abs(denom) <= 1e-9:
+                return a[0], y_edge
+            t = (y_edge - a[1]) / denom
+            return a[0] + t * (b[0] - a[0]), y_edge
+
+        clipped = clip(poly, lambda p: p[0] >= x0, lambda a, b: interp_x(a, b, x0))
+        clipped = clip(clipped, lambda p: p[0] <= x1, lambda a, b: interp_x(a, b, x1))
+        clipped = clip(clipped, lambda p: p[1] >= y0, lambda a, b: interp_y(a, b, y0))
+        clipped = clip(clipped, lambda p: p[1] <= y1, lambda a, b: interp_y(a, b, y1))
+        return clipped
+
+    def _polygon_area(self, poly: List[Tuple[float, float]]) -> float:
+        if len(poly) < 3:
+            return 0.0
+        area = 0.0
+        for idx, (x1, y1) in enumerate(poly):
+            x2, y2 = poly[(idx + 1) % len(poly)]
+            area += x1 * y2 - x2 * y1
+        return abs(area) * 0.5
 
     def _pose_collides(
         self,
