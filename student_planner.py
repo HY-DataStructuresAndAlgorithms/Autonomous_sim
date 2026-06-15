@@ -42,12 +42,6 @@ USE_ASYNC_PLANNING = os.getenv("PARKING_ASYNC_PLANNER", "1").lower() not in {
     "off",
     "no",
 }
-USE_ORIENTATION_CONSTRAINT = os.getenv("PARKING_USE_ORIENTATION", "0").lower() not in {
-    "0",
-    "false",
-    "off",
-    "no",
-}
 VEHICLE_LONGEST_LENGTH = 3.0
 VEHICLE_BOUNDARY_DIAMETER = VEHICLE_LONGEST_LENGTH * 1.20
 VEHICLE_CENTER_CLEARANCE = 0.5 * VEHICLE_BOUNDARY_DIAMETER
@@ -87,7 +81,7 @@ PREVIEW_MAX_BRAKE = 4.5
 PREVIEW_STEER_RATE = math.radians(240.0)
 PREVIEW_SUCCESS_IOU = 0.45
 PARKING_DEEP_IOU_TARGET = 0.50
-PARKING_CREEP_IOU = 0.15
+PARKING_CREEP_IOU = 0.25
 PARKING_STOP_IOU = 0.48
 SPATIAL_INDEX_CELL_SIZE = 4.0
 CLEARANCE_QUERY_RADIUS = 8.0
@@ -98,9 +92,6 @@ GUIDED_RISK_COST_WEIGHT = 0.05
 GUIDED_CLEARANCE_COST_WEIGHT = 0.02
 GUIDED_NEAR_LINE_COST_WEIGHT = 0.04
 GUIDED_NEAR_LINE_THRESHOLD = 1.10
-GUIDED_TURN_COST = 0.18
-GUIDED_CANDIDATE_MIN_CLEARANCE = 0.32
-GUIDED_EXTRA_CANDIDATE_FREE_SLOTS = 3
 GUIDED_FAST_APPROACH_SPEED = 3.30
 GUIDED_FAST_APPROACH_CLEARANCE = 1.45
 GUIDED_FAST_APPROACH_STEER = math.radians(14.0)
@@ -203,7 +194,7 @@ class PlannerSkeleton:
     def set_map(self, map_payload: Dict[str, Any]) -> None:
         """Store static map data sent by the simulator."""
 
-        self.map_data = dict(map_payload)
+        self.map_data = map_payload
         self.map_extent = tuple(
             map(float, map_payload.get("extent", (0.0, 0.0, 0.0, 0.0)))
         )
@@ -272,7 +263,10 @@ class PlannerSkeleton:
             return
 
         self.target_signature = tuple(round(float(v), 3) for v in slot)
-        guided_plan = self._orientation_candidate_plan(start, slot, obs)
+        target_pose = self._target_pose(slot)
+        guided_plan = self._semantic_guided_entry_plan(start, slot, target_pose, obs)
+        if guided_plan is None:
+            guided_plan = self._direct_semantic_entry_fallback(start, slot, target_pose)
         if guided_plan is None:
             self.planning_fail_reason = "semantic_guided_planner_failed"
             print("[algo] planning failed: semantic-guided planner produced no candidate")
@@ -293,68 +287,6 @@ class PlannerSkeleton:
             f" waypoints={len(self.waypoints)}"
         )
         return
-
-    def _orientation_candidate_plan(
-        self,
-        start: Tuple[float, float, float],
-        slot: List[float],
-        obs: Dict[str, Any],
-    ) -> Optional[EntryPlan]:
-        original_expected = str((self.map_data or {}).get("expected_orientation") or "")
-        if USE_ORIENTATION_CONSTRAINT:
-            target_pose = self._target_pose(slot)
-            plan = self._semantic_guided_entry_plan(start, slot, target_pose, obs)
-            return plan or self._direct_semantic_entry_fallback(start, slot, target_pose)
-
-        preferred = original_expected if original_expected in {"front_in", "rear_in"} else "front_in"
-        # If the simulator explicitly asks for front-in/rear-in, do not solve a
-        # different task just because it previews easier.  That was producing
-        # front-in stages where the car repeatedly reversed into the slot.
-        if original_expected in {"front_in", "rear_in"}:
-            order = [preferred]
-        else:
-            order = [preferred, "rear_in" if preferred == "front_in" else "front_in"]
-        candidates: List[EntryPlan] = []
-        for expected in order:
-            if self.map_data is not None:
-                self.map_data["expected_orientation"] = expected
-            target_pose = self._target_pose(slot)
-            plan = self._semantic_guided_entry_plan(start, slot, target_pose, obs)
-            if plan is None:
-                plan = self._direct_semantic_entry_fallback(start, slot, target_pose)
-            if plan is not None:
-                setattr(plan, "_orientation_label", expected)
-                candidates.append(plan)
-                if expected == preferred and plan.preview_reason not in {"collision", "timeout"}:
-                    break
-
-        if not candidates:
-            if self.map_data is not None:
-                self.map_data["expected_orientation"] = original_expected
-            return None
-        def candidate_key(plan: EntryPlan) -> Tuple[int, float]:
-            label = getattr(plan, "_orientation_label", "")
-            if label == original_expected and plan.preview_reason != "collision":
-                priority = 0
-            elif plan.preview_reason == "success":
-                priority = 1
-            elif plan.preview_reason in {"rear_open_arc", "rear_turnaround", "direct"}:
-                priority = 2
-            elif label == original_expected:
-                priority = 3
-            elif plan.preview_reason == "timeout":
-                priority = 4
-            elif plan.preview_reason == "collision":
-                priority = 5
-            else:
-                priority = 2
-            return priority, plan.score
-
-        chosen = min(candidates, key=candidate_key)
-        chosen_orientation = getattr(chosen, "_orientation_label", original_expected)
-        if self.map_data is not None:
-            self.map_data["expected_orientation"] = chosen_orientation
-        return chosen
 
     def compute_control(self, obs: Dict[str, Any]) -> Dict[str, Any]:
         """Return steering, acceleration, brake, and gear for one simulation tick."""
@@ -389,23 +321,17 @@ class PlannerSkeleton:
             final_dist = math.hypot(target_center[0] - x, target_center[1] - y)
             center_tolerance = self._slot_center_tolerance(slot)
             slot_entered = self._point_in_slot(slot, x, y, margin=0.05)
-            slot_iou = self._slot_iou(tuple(float(v) for v in slot), x, y, yaw)
         else:
             target_center = (final_wp[0], final_wp[1])
             final_dist = math.hypot(final_wp[0] - x, final_wp[1] - y)
             center_tolerance = 0.55
             slot_entered = False
-            slot_iou = 0.0
         final_yaw_error = abs(self._wrap_to_pi(final_wp[2] - yaw))
         obstacle_dist = self._estimate_min_obstacle_distance((x, y))
         self.min_obstacle_distance = min(self.min_obstacle_distance, obstacle_dist)
         collision_risk = False
 
-        if (
-            final_dist <= center_tolerance
-            and final_yaw_error < math.radians(14.0)
-            and (len(slot) != 4 or slot_iou >= PREVIEW_SUCCESS_IOU)
-        ):
+        if final_dist <= center_tolerance and final_yaw_error < math.radians(14.0):
             self._log_evaluation(
                 parking_success=True,
                 fail_reason="none",
@@ -448,19 +374,15 @@ class PlannerSkeleton:
             target_yaw=final_wp[2],
             tolerance=max(center_tolerance, PARKING_TARGET_OVERSHOOT),
         )
-        expected_orientation = str((self.map_data or {}).get("expected_orientation") or "").lower()
-        allow_reverse_recovery = expected_orientation.startswith("rear")
         if not terminal_plan_active:
             if self.parking_reverse_cooldown > 0:
                 self.parking_reverse_cooldown -= 1
             should_reverse_for_alignment = (
-                allow_reverse_recovery
-                and
                 not self.parking_has_reversed
                 and final_yaw_error > PARKING_REVERSE_YAW_ERROR
             )
-            should_reverse_for_obstacle = allow_reverse_recovery and forward_clearance < PARKING_REVERSE_WALL_CLEARANCE
-            should_reverse_after_forward = allow_reverse_recovery and self.parking_has_reversed and (
+            should_reverse_for_obstacle = forward_clearance < PARKING_REVERSE_WALL_CLEARANCE
+            should_reverse_after_forward = self.parking_has_reversed and (
                 should_reverse_for_obstacle or target_overshot
             )
             if (
@@ -674,7 +596,7 @@ class PlannerSkeleton:
             # stop point. Stop when either IoU is meaningfully better, or when the
             # planned final pose has actually been reached.
             stop_ready = (
-                (slot_iou >= PARKING_STOP_IOU or (slot_iou >= PREVIEW_SUCCESS_IOU and final_dist < 0.18))
+                (slot_iou >= PARKING_STOP_IOU or (slot_iou >= 0.30 and final_dist < 0.26))
                 and final_yaw_error < math.radians(18.0)
                 and speed < 0.22
             )
@@ -698,6 +620,7 @@ class PlannerSkeleton:
             terminal_plan_active
             and target_slot_tuple is not None
             and ANTI_EARLY_SUCCESS_IOU <= slot_iou < PARKING_STOP_IOU
+            and final_dist > ANTI_EARLY_SUCCESS_MIN_DIST
             and final_yaw_error < math.radians(24.0)
             and obstacle_dist > ANTI_EARLY_SUCCESS_MIN_CLEARANCE
         )
@@ -725,13 +648,7 @@ class PlannerSkeleton:
         target_wp = self.waypoints[target_idx]
         gear = target_wp[3]
 
-        allow_creep_gear_change = (
-            terminal_plan_active
-            and target_slot_tuple is not None
-            and PARKING_CREEP_IOU <= slot_iou < PARKING_STOP_IOU
-            and obstacle_dist > 0.05
-        )
-        if gear != self.last_command_gear and speed > 0.12 and not allow_creep_gear_change:
+        if gear != self.last_command_gear and speed > 0.12:
             return {
                 "steer": 0.0,
                 "accel": 0.0,
@@ -781,11 +698,11 @@ class PlannerSkeleton:
             and final_yaw_error < math.radians(22.0)
             and obstacle_dist > 0.05
         ):
-            rule_speed = max(rule_speed, 0.72)
+            rule_speed = max(rule_speed, 0.50)
         if anti_early_success_guard:
             # Keep just enough motion to avoid the simulator declaring success at
             # IoU~=0.30 while we are still short of the planned final pose.
-            rule_speed = max(rule_speed, 0.62)
+            rule_speed = max(rule_speed, ANTI_EARLY_SUCCESS_SPEED)
         if (
             terminal_plan_active
             and not expected.startswith("rear")
@@ -817,8 +734,8 @@ class PlannerSkeleton:
             front_is_clear=front_is_clear,
             force_full_accel=force_full_accel,
         )
-        if anti_early_success_guard and speed < 0.28:
-            accel = max(accel, 0.35)
+        if anti_early_success_guard and speed < 0.22:
+            accel = max(accel, 0.18)
             brake = 0.0
         self._log_evaluation(
             parking_success=False,
@@ -923,16 +840,12 @@ class PlannerSkeleton:
         if self.waypoint_index >= self.hybrid_start_index:
             target = min(target, 0.72)
             if final_dist < 1.4:
-                terminal_cap = 0.38 if obstacle_dist > 0.35 else 0.24
-                target = min(target, terminal_cap)
+                target = min(target, 0.24)
         return target
 
     def _target_pose(self, slot: List[float]) -> Tuple[float, float, float]:
         cx, cy = self._slot_center(slot)
         expected = str((self.map_data or {}).get("expected_orientation") or "")
-        if not expected:
-            open_y_sign = self._open_side_y_sign(slot)
-            return cx, cy, -open_y_sign * math.pi / 2.0
         yaw = -math.pi / 2.0 if expected.lower().startswith("rear") else math.pi / 2.0
         if expected.lower().startswith("rear") and self.map_extent is not None:
             xmin, xmax, ymin, _ymax = self.map_extent
@@ -992,6 +905,8 @@ class PlannerSkeleton:
             plans.append(semantic_plan)
             if semantic_plan.preview_reason in {"success", "rear_turnaround"}:
                 return semantic_plan
+            if not expected.startswith("rear") and semantic_plan.preview_reason != "collision":
+                return semantic_plan
             if semantic_plan.preview_reason == "collision" and not expected.startswith("rear"):
                 clearance_plan = self._build_entry_plan_for_sign(
                     semantic_sign,
@@ -1005,6 +920,8 @@ class PlannerSkeleton:
                 if clearance_plan is not None:
                     plans.append(clearance_plan)
                     if clearance_plan.preview_reason in {"success", "rear_turnaround"}:
+                        return clearance_plan
+                    if not expected.startswith("rear") and clearance_plan.preview_reason != "collision":
                         return clearance_plan
         opposite_plan = self._build_entry_plan_for_sign(
             -semantic_sign,
@@ -1030,19 +947,9 @@ class PlannerSkeleton:
                     plans.append(clearance_opposite_plan)
         if not plans:
             return None
-        success_plans = [plan for plan in plans if plan.preview_reason == "success"]
-        if success_plans:
-            return min(success_plans, key=lambda plan: plan.score)
-        usable_plans = [
-            plan
-            for plan in plans
-            if plan.preview_reason in {"rear_open_arc", "rear_turnaround", "direct"}
-        ]
-        if usable_plans:
-            return min(usable_plans, key=lambda plan: plan.score)
-        timeout_plans = [plan for plan in plans if plan.preview_reason == "timeout"]
-        if timeout_plans:
-            return min(timeout_plans, key=lambda plan: plan.score)
+        non_collision_plans = [plan for plan in plans if plan.preview_reason != "collision"]
+        if non_collision_plans:
+            return min(non_collision_plans, key=lambda plan: plan.score)
         return min(plans, key=lambda plan: plan.score)
 
     def _direct_semantic_entry_fallback(
@@ -1163,8 +1070,7 @@ class PlannerSkeleton:
             return score
 
         best: Optional[Tuple[Tuple[float, float, float], List[Tuple[float, float]], float]] = None
-        low_clearance_best: Optional[Tuple[Tuple[float, float, float], List[Tuple[float, float]], float]] = None
-        for candidate in sorted(candidates, key=rough)[: self._guided_candidate_eval_limit()]:
+        for candidate in sorted(candidates, key=rough)[:GUIDED_CANDIDATE_EVAL_LIMIT]:
             grid_path = self._guided_astar_path(
                 start_xy,
                 (candidate[0], candidate[1]),
@@ -1184,34 +1090,20 @@ class PlannerSkeleton:
             radial = abs(final_leg - 3.2)
             entry_heading_error = self._entry_heading_error(grid_path, target_yaw)
             join_turn = self._terminal_join_turn(grid_path, target_pose)
-            turn_amount = self._path_turn_amount(grid_path)
             cost = (
                 1.10 * path_len
                 + 0.55 * final_leg
-                + 0.95 / max(clearance, 0.25)
+                + 0.55 / max(clearance, 0.25)
                 + 1.8 * risk
                 + 3.4 * ray_error
                 + 0.75 * lateral
                 + 0.25 * radial
                 + 1.35 * entry_heading_error
                 + 0.75 * join_turn
-                + 0.85 * turn_amount
             )
-            if clearance < GUIDED_CANDIDATE_MIN_CLEARANCE:
-                risk_cost = cost + 12.0 * (GUIDED_CANDIDATE_MIN_CLEARANCE - clearance + 0.05)
-                if low_clearance_best is None or risk_cost < low_clearance_best[2]:
-                    low_clearance_best = (candidate, grid_path, risk_cost)
-                continue
             if best is None or cost < best[2]:
                 best = (candidate, grid_path, cost)
-        return best if best is not None else low_clearance_best
-
-    def _guided_candidate_eval_limit(self) -> int:
-        occupied = (self.map_data or {}).get("occupied_idx") or []
-        free_slots = sum(1 for occupied_flag in occupied if not occupied_flag)
-        if free_slots <= GUIDED_EXTRA_CANDIDATE_FREE_SLOTS:
-            return max(GUIDED_CANDIDATE_EVAL_LIMIT, 4)
-        return GUIDED_CANDIDATE_EVAL_LIMIT
+        return best
 
     def _approach_ray_error(
         self,
@@ -1362,81 +1254,35 @@ class PlannerSkeleton:
             (1, -1, 1.414),
             (1, 1, 1.414),
         ]
-        if not self._is_single_free_slot_map():
-            open_heap_plain: List[Tuple[float, float, Tuple[int, int]]] = []
-            heapq.heappush(open_heap_plain, (0.0, 0.0, start))
-            came_from_plain: Dict[Tuple[int, int], Tuple[int, int]] = {}
-            cost_plain: Dict[Tuple[int, int], float] = {start: 0.0}
-            while open_heap_plain:
-                _, _, current = heapq.heappop(open_heap_plain)
-                if current == goal:
-                    break
-                for dr, dc, move_cost in motions:
-                    nxt = (current[0] + dr, current[1] + dc)
-                    if not (0 <= nxt[0] < rows and 0 <= nxt[1] < cols):
-                        continue
-                    if blocked[nxt[0]][nxt[1]]:
-                        continue
-                    new_cost = cost_plain[current] + move_cost
-                    if distance_field is not None:
-                        new_cost += self._guided_cell_risk_cost(nxt, distance_field)
-                    if new_cost >= cost_plain.get(nxt, float("inf")):
-                        continue
-                    cost_plain[nxt] = new_cost
-                    heuristic = math.hypot(goal[0] - nxt[0], goal[1] - nxt[1])
-                    heapq.heappush(open_heap_plain, (new_cost + heuristic, new_cost, nxt))
-                    came_from_plain[nxt] = current
-            if goal not in came_from_plain and goal != start:
-                return []
-            cells = [goal]
-            while cells[-1] != start:
-                cells.append(came_from_plain[cells[-1]])
-            cells.reverse()
-            path = [start_xy]
-            path.extend(to_world(cell) for cell in cells[1:-1])
-            path.append(goal_xy)
-            return self._shortcut_guided_path(path)
-
-        start_state = (start[0], start[1], -1)
-        goal_state: Optional[Tuple[int, int, int]] = None
-        open_heap: List[Tuple[float, float, Tuple[int, int, int]]] = []
-        heapq.heappush(open_heap, (0.0, 0.0, start_state))
-        came_from: Dict[Tuple[int, int, int], Tuple[int, int, int]] = {}
-        cost_so_far: Dict[Tuple[int, int, int], float] = {start_state: 0.0}
+        open_heap: List[Tuple[float, float, Tuple[int, int]]] = []
+        heapq.heappush(open_heap, (0.0, 0.0, start))
+        came_from: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        cost_so_far: Dict[Tuple[int, int], float] = {start: 0.0}
         while open_heap:
             _, _, current = heapq.heappop(open_heap)
-            current_cell = (current[0], current[1])
-            if current_cell == goal:
-                goal_state = current
+            if current == goal:
                 break
-            for direction_idx, (dr, dc, move_cost) in enumerate(motions):
-                nxt_cell = (current[0] + dr, current[1] + dc)
-                nxt = (nxt_cell[0], nxt_cell[1], direction_idx)
-                if not (0 <= nxt_cell[0] < rows and 0 <= nxt_cell[1] < cols):
+            for dr, dc, move_cost in motions:
+                nxt = (current[0] + dr, current[1] + dc)
+                if not (0 <= nxt[0] < rows and 0 <= nxt[1] < cols):
                     continue
-                if blocked[nxt_cell[0]][nxt_cell[1]]:
+                if blocked[nxt[0]][nxt[1]]:
                     continue
-                turn_cost = (
-                    0.0
-                    if current[2] < 0 or current[2] == direction_idx or not self._is_single_free_slot_map()
-                    else GUIDED_TURN_COST
-                )
-                new_cost = cost_so_far[current] + move_cost + turn_cost
+                new_cost = cost_so_far[current] + move_cost
                 if distance_field is not None:
-                    new_cost += self._guided_cell_risk_cost(nxt_cell, distance_field)
+                    new_cost += self._guided_cell_risk_cost(nxt, distance_field)
                 if new_cost >= cost_so_far.get(nxt, float("inf")):
                     continue
                 cost_so_far[nxt] = new_cost
-                heuristic = math.hypot(goal[0] - nxt_cell[0], goal[1] - nxt_cell[1])
+                heuristic = math.hypot(goal[0] - nxt[0], goal[1] - nxt[1])
                 heapq.heappush(open_heap, (new_cost + heuristic, new_cost, nxt))
                 came_from[nxt] = current
-        if goal_state is None:
+        if goal not in came_from and goal != start:
             return []
-        states = [goal_state]
-        while states[-1] != start_state:
-            states.append(came_from[states[-1]])
-        states.reverse()
-        cells = [(state[0], state[1]) for state in states]
+        cells = [goal]
+        while cells[-1] != start:
+            cells.append(came_from[cells[-1]])
+        cells.reverse()
         path = [start_xy]
         path.extend(to_world(cell) for cell in cells[1:-1])
         path.append(goal_xy)
@@ -1536,36 +1382,19 @@ class PlannerSkeleton:
         limits = obs.get("limits", {})
         wheelbase = float(limits.get("L", 2.6))
         max_steer = float(limits.get("maxSteer", math.radians(35.0)))
+        pose_path = self._terminal_hybrid_astar(
+            (approach_pose[0], approach_pose[1], local_yaw),
+            target_pose,
+            tuple(float(v) for v in slot),
+            wheelbase=wheelbase,
+            max_steer=max_steer,
+        )
+
         plan_options: List[EntryPlan] = []
         semantic_match = sign == semantic_sign
-        expected = str((self.map_data or {}).get("expected_orientation") or "").lower()
-        rear_required = expected.startswith("rear")
-        terminal_gears = ("D", "R")
 
-        terminal_variants: List[Tuple[List[Tuple[float, float]], float]] = [(simplified, local_yaw)]
-        if self._is_single_free_slot_map():
-            for trim in (1, 2):
-                if len(simplified) > trim + 2:
-                    trimmed = simplified[:-trim]
-                    a = trimmed[-2]
-                    b = trimmed[-1]
-                    trimmed_yaw = math.atan2(b[1] - a[1], b[0] - a[0])
-                    if math.hypot(trimmed[-1][0] - target_pose[0], trimmed[-1][1] - target_pose[1]) < 14.0:
-                        terminal_variants.append((trimmed, trimmed_yaw))
-
-        for terminal_points, terminal_yaw in terminal_variants:
-            terminal_start = (terminal_points[-1][0], terminal_points[-1][1], terminal_yaw)
-            pose_path = self._terminal_hybrid_astar(
-                terminal_start,
-                target_pose,
-                tuple(float(v) for v in slot),
-                wheelbase=wheelbase,
-                max_steer=max_steer,
-                allowed_gears=terminal_gears,
-            )
-            if not pose_path:
-                continue
-            approach_waypoints = self._points_to_waypoints(terminal_points[:-1], final_yaw=terminal_yaw, gear="D")
+        if pose_path:
+            approach_waypoints = self._points_to_waypoints(simplified[:-1], final_yaw=local_yaw, gear="D")
             hybrid_start_index = len(approach_waypoints)
             waypoints = approach_waypoints + self._pose_path_to_waypoints(pose_path, target_pose)
             waypoints, hybrid_start_index = self._add_start_stabilizer(
@@ -1581,8 +1410,7 @@ class PlannerSkeleton:
                 wheelbase=wheelbase,
                 max_steer=max_steer,
             )
-            score = preview_score + 0.025 * grid_cost + 0.35 * max(0, len(simplified) - len(terminal_points))
-            score += 2.2 * self._entry_direction_cost(waypoints, target_pose)
+            score = preview_score + 0.025 * grid_cost
             if semantic_match:
                 score -= SEMANTIC_ENTRY_BONUS
             plan_options.append(
@@ -1599,54 +1427,11 @@ class PlannerSkeleton:
                 )
             )
 
-        front_axis_plan = None
-        if not rear_required:
-            front_axis_plan = self._front_in_axis_docking_waypoints(
-                simplified=simplified,
-                target_pose=target_pose,
-                target_slot=tuple(float(v) for v in slot),
-                sign=sign,
-            )
-        if front_axis_plan:
-            front_axis_waypoints, front_axis_hybrid_start = front_axis_plan
-            front_axis_waypoints, front_axis_hybrid_start = self._add_start_stabilizer(
-                front_axis_waypoints,
-                front_axis_hybrid_start,
-                start,
-            )
-            preview_score, preview_reason, preview_iou_proxy = self._preview_waypoints(
-                front_axis_waypoints,
-                front_axis_hybrid_start,
-                start,
-                tuple(float(v) for v in slot),
-                wheelbase=wheelbase,
-                max_steer=max_steer,
-            )
-            if preview_reason == "success":
-                score = preview_score + 0.025 * grid_cost - 1.4
-                if semantic_match:
-                    score -= SEMANTIC_ENTRY_BONUS
-                plan_options.append(
-                    EntryPlan(
-                        sign=sign,
-                        semantic_match=semantic_match,
-                        fallback_used=False,
-                        score=score,
-                        preview_reason=preview_reason,
-                        preview_iou_proxy=preview_iou_proxy,
-                        grid_cost=grid_cost,
-                        hybrid_start_index=front_axis_hybrid_start,
-                        waypoints=front_axis_waypoints,
-                    )
-                )
-
-        open_axis_plan = None
-        if rear_required:
-            open_axis_plan = self._rear_in_open_side_axis_waypoints(
-                simplified=simplified,
-                target_pose=target_pose,
-                target_slot=tuple(float(v) for v in slot),
-            )
+        open_axis_plan = self._rear_in_open_side_axis_waypoints(
+            simplified=simplified,
+            target_pose=target_pose,
+            target_slot=tuple(float(v) for v in slot),
+        )
         if open_axis_plan:
             open_axis_waypoints, open_axis_hybrid_start = open_axis_plan
             open_axis_waypoints, open_axis_hybrid_start = self._add_start_stabilizer(
@@ -1679,15 +1464,13 @@ class PlannerSkeleton:
                 )
             )
 
-        open_arc_plan = None
-        if rear_required:
-            open_arc_plan = self._rear_in_open_side_arc_waypoints(
-                simplified=simplified,
-                target_pose=target_pose,
-                target_slot=tuple(float(v) for v in slot),
-                wheelbase=wheelbase,
-                max_steer=max_steer,
-            )
+        open_arc_plan = self._rear_in_open_side_arc_waypoints(
+            simplified=simplified,
+            target_pose=target_pose,
+            target_slot=tuple(float(v) for v in slot),
+            wheelbase=wheelbase,
+            max_steer=max_steer,
+        )
         if open_arc_plan:
             open_arc_waypoints, open_arc_hybrid_start = open_arc_plan
             open_arc_waypoints, open_arc_hybrid_start = self._add_start_stabilizer(
@@ -1703,17 +1486,10 @@ class PlannerSkeleton:
                 wheelbase=wheelbase,
                 max_steer=max_steer,
             )
-            # Only keep timeout arc templates as optimistic fallbacks.  A previewed
-            # collision must remain a collision; converting it into rear_open_arc can
-            # make the selector choose a path that physically hits the dense row.
-            if preview_reason == "timeout" or (
-                preview_reason == "collision" and self._is_single_free_slot_map()
-            ):
+            if preview_reason in {"collision", "timeout"}:
                 preview_reason = "rear_open_arc"
                 preview_score = 36.0
                 preview_iou_proxy = max(preview_iou_proxy, 0.30)
-            elif preview_reason == "collision":
-                preview_score += 5000.0
             score = preview_score + 0.025 * grid_cost - 1.8
             if semantic_match:
                 score -= SEMANTIC_ENTRY_BONUS
@@ -1731,16 +1507,14 @@ class PlannerSkeleton:
                 )
             )
 
-        rear_axis_plan = None
-        if rear_required:
-            rear_axis_plan = self._rear_in_axis_docking_waypoints(
-                simplified=simplified,
-                local_yaw=local_yaw,
-                target_pose=target_pose,
-                target_slot=tuple(float(v) for v in slot),
-                wheelbase=wheelbase,
-                max_steer=max_steer,
-            )
+        rear_axis_plan = self._rear_in_axis_docking_waypoints(
+            simplified=simplified,
+            local_yaw=local_yaw,
+            target_pose=target_pose,
+            target_slot=tuple(float(v) for v in slot),
+            wheelbase=wheelbase,
+            max_steer=max_steer,
+        )
         if rear_axis_plan:
             rear_axis_waypoints, rear_axis_hybrid_start = rear_axis_plan
             rear_axis_waypoints, rear_axis_hybrid_start = self._add_start_stabilizer(
@@ -1757,17 +1531,10 @@ class PlannerSkeleton:
                 max_steer=max_steer,
             )
             if self._is_rear_turnaround_candidate(rear_axis_waypoints):
-                # Same rule as open-side arc: timeout can be a usable conservative
-                # fallback, but a predicted collision should not be disguised as a
-                # safe turnaround candidate.
-                if preview_reason == "timeout" or (
-                    preview_reason == "collision" and self._is_single_free_slot_map()
-                ):
+                if preview_reason in {"collision", "timeout"}:
                     preview_reason = "rear_turnaround"
                     preview_score = 40.0
                     preview_iou_proxy = max(preview_iou_proxy, 0.30)
-                elif preview_reason == "collision":
-                    preview_score += 5000.0
             score = preview_score + 0.025 * grid_cost - 1.2
             if semantic_match:
                 score -= SEMANTIC_ENTRY_BONUS
@@ -1801,7 +1568,6 @@ class PlannerSkeleton:
             max_steer=max_steer,
         )
         score = preview_score + 0.025 * grid_cost + FALLBACK_ENTRY_PENALTY
-        score += 2.2 * self._entry_direction_cost(top_entry_waypoints, target_pose)
         if semantic_match:
             score -= SEMANTIC_ENTRY_BONUS
         plan_options.append(
@@ -1823,76 +1589,6 @@ class PlannerSkeleton:
             return min(non_collision, key=lambda plan: plan.score)
         return min(plan_options, key=lambda plan: plan.score)
 
-    def _entry_direction_cost(
-        self,
-        waypoints: List[Waypoint],
-        target_pose: Tuple[float, float, float],
-    ) -> float:
-        if len(waypoints) < 2:
-            return 0.0
-        tx, ty, target_yaw = target_pose
-        goal_forward = (math.cos(target_yaw), math.sin(target_yaw))
-        best = 1.0
-        for idx in range(len(waypoints) - 1, 0, -1):
-            prev = waypoints[idx - 1]
-            cur = waypoints[idx]
-            dx = cur[0] - prev[0]
-            dy = cur[1] - prev[1]
-            norm = math.hypot(dx, dy)
-            if norm < 1e-6:
-                continue
-            # Convert path segment into actual vehicle motion direction.  A
-            # reverse waypoint means the car's heading is opposite the segment.
-            motion = (dx / norm, dy / norm)
-            if cur[3] == "R":
-                motion = (-motion[0], -motion[1])
-            to_goal = math.hypot(cur[0] - tx, cur[1] - ty)
-            if to_goal > 6.0:
-                continue
-            front_cost = 1.0 - max(0.0, motion[0] * goal_forward[0] + motion[1] * goal_forward[1])
-            rear_cost = 1.0 - max(0.0, -motion[0] * goal_forward[0] - motion[1] * goal_forward[1])
-            expected = str((self.map_data or {}).get("expected_orientation") or "").lower()
-            best = front_cost if not expected.startswith("rear") else rear_cost
-            break
-        return best
-
-    def _front_in_axis_docking_waypoints(
-        self,
-        simplified: List[Tuple[float, float]],
-        target_pose: Tuple[float, float, float],
-        target_slot: Tuple[float, float, float, float],
-        sign: float,
-    ) -> Optional[Tuple[List[Waypoint], int]]:
-        if len(simplified) < 2:
-            return None
-        tx, ty, target_yaw = target_pose
-        forward = (math.cos(target_yaw), math.sin(target_yaw))
-        slot_depth = abs(target_slot[3] - target_slot[2])
-        staging_dist = max(2.4, 0.65 * slot_depth)
-        pre_dist = staging_dist + 1.4
-        pre_staging = (tx + sign * forward[0] * pre_dist, ty + sign * forward[1] * pre_dist)
-        staging = (tx + sign * forward[0] * staging_dist, ty + sign * forward[1] * staging_dist)
-        if (
-            not self._guided_inside_map(pre_staging[0], pre_staging[1], margin=0.35)
-            or not self._guided_inside_map(staging[0], staging[1], margin=0.35)
-        ):
-            return None
-        if min(self._guided_clearance(pre_staging), self._guided_clearance(staging)) < 0.35:
-            return None
-
-        waypoints = self._points_to_waypoints(simplified[:-1], final_yaw=target_yaw, gear="D")
-        for point in (pre_staging, staging):
-            if not waypoints or math.hypot(point[0] - waypoints[-1][0], point[1] - waypoints[-1][1]) > 0.35:
-                waypoints.append((point[0], point[1], target_yaw, "D"))
-        hybrid_start_index = len(waypoints)
-        for distance in (staging_dist * 0.75, staging_dist * 0.50, staging_dist * 0.25, 0.0):
-            px = tx + sign * forward[0] * distance
-            py = ty + sign * forward[1] * distance
-            waypoints.append((px, py, target_yaw, "R"))
-        if not self._axis_reverse_segment_clear(waypoints, target_slot):
-            return None
-        return waypoints, hybrid_start_index
-
     def _is_rear_turnaround_candidate(self, waypoints: List[Waypoint]) -> bool:
         expected = str((self.map_data or {}).get("expected_orientation") or "").lower()
         if not expected.startswith("rear"):
@@ -1902,12 +1598,6 @@ class PlannerSkeleton:
         gear_switches = sum(1 for idx in range(1, len(waypoints)) if waypoints[idx][3] != waypoints[idx - 1][3])
         reverse_count = sum(1 for waypoint in waypoints if waypoint[3] == "R")
         return gear_switches == 1 and reverse_count >= 5
-
-    def _is_single_free_slot_map(self) -> bool:
-        occupied = (self.map_data or {}).get("occupied_idx") or []
-        if not occupied:
-            return False
-        return sum(1 for value in occupied if not bool(value)) <= 1
 
     def _add_start_stabilizer(
         self,
@@ -2307,8 +1997,7 @@ class PlannerSkeleton:
     ) -> List[Waypoint]:
         tx, ty, target_yaw = target_pose
         forward = (math.cos(target_yaw), math.sin(target_yaw))
-        expected = str((self.map_data or {}).get("expected_orientation") or "").lower()
-        final_gear = "R" if expected.startswith("rear") and sign > 0.0 else "D"
+        final_gear = "R" if sign > 0.0 else "D"
         waypoints: List[Waypoint] = []
         for idx, point in enumerate(approach_path):
             if idx < len(approach_path) - 1:
@@ -3387,22 +3076,6 @@ class PlannerSkeleton:
             math.hypot(path[i][0] - path[i - 1][0], path[i][1] - path[i - 1][1])
             for i in range(1, len(path))
         )
-
-    def _path_turn_amount(self, path: List[Tuple[float, float]]) -> float:
-        if len(path) < 3:
-            return 0.0
-        total = 0.0
-        prev_heading: Optional[float] = None
-        for idx in range(1, len(path)):
-            dx = path[idx][0] - path[idx - 1][0]
-            dy = path[idx][1] - path[idx - 1][1]
-            if math.hypot(dx, dy) < 1e-6:
-                continue
-            heading = math.atan2(dy, dx)
-            if prev_heading is not None:
-                total += abs(self._wrap_to_pi(heading - prev_heading))
-            prev_heading = heading
-        return total
 
     def _speed_command(
         self,

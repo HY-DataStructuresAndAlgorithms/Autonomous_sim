@@ -22,7 +22,27 @@ WIDTH = 1400
 HEIGHT = 850
 PADDING = 60
 SCRIPT_DIR = Path(__file__).resolve().parent
-SIM_DIR = SCRIPT_DIR.parent / "self-parking-sim"
+
+
+def resolve_sim_dir() -> Path:
+    candidates: list[Path] = []
+    env_path = os.getenv("PARKING_SIM_DIR")
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.extend(
+        [
+            SCRIPT_DIR.parent / "self-parking-sim",
+            SCRIPT_DIR.parent / "self-parking-sim-main",
+            Path.home() / "Downloads" / "self-parking-sim-main",
+        ]
+    )
+    for candidate in candidates:
+        if (candidate / "demo_self_parking_sim.py").exists():
+            return candidate.resolve()
+    return candidates[0].resolve() if candidates else (SCRIPT_DIR.parent / "self-parking-sim")
+
+
+SIM_DIR = resolve_sim_dir()
 
 
 def load_replay(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -36,17 +56,22 @@ def load_replay(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     return meta if isinstance(meta, dict) else {}, frames
 
 
-def latest_replay(replay_dir: Path) -> Path:
-    replay_dir = replay_dir.resolve()
-    files = sorted(replay_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+def latest_replay(*replay_dirs: Path) -> Path:
+    files: list[Path] = []
+    for replay_dir in replay_dirs:
+        replay_dir = replay_dir.resolve()
+        if replay_dir.exists():
+            files.extend(replay_dir.glob("*.json"))
+    files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
     if not files:
-        raise FileNotFoundError(f"No replay JSON files found in {replay_dir}")
+        searched = ", ".join(str(path.resolve()) for path in replay_dirs)
+        raise FileNotFoundError(f"No replay JSON files found in {searched}")
     return files[0]
 
 
 def resolve_input_path(path: Path | None, default_dir: Path) -> Path:
     if path is None:
-        return latest_replay(default_dir)
+        return latest_replay(SIM_DIR / "replays", default_dir)
     if path.is_absolute() or path.exists():
         return path.resolve()
     script_relative = SCRIPT_DIR / path
@@ -127,6 +152,23 @@ def load_sim_map(meta: dict[str, Any]) -> Any | None:
     if context is None:
         return None
     return context.get("assets")
+
+
+class PayloadMapAssets:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.extent = payload.get("extent") or (0.0, 75.0, 0.0, 50.0)
+        self.slots = payload.get("slots") or []
+        self.occupied_idx = payload.get("occupied_idx") or []
+        self.walls_rects = payload.get("walls_rects") or []
+        self.lines = payload.get("lines") or []
+        self.border = payload.get("border") or self.extent
+
+
+def map_assets_from_payload(meta: dict[str, Any]) -> Any | None:
+    payload = meta.get("map_payload")
+    if not isinstance(payload, dict):
+        return None
+    return PayloadMapAssets(payload)
 
 
 def bounds(
@@ -284,10 +326,20 @@ def info_lines(
     final_v = final_speed(frames)
     stats_with_final = dict(stats)
     stats_with_final.setdefault("final_speed", final_v)
+    map_payload = meta.get("map_payload") if isinstance(meta.get("map_payload"), dict) else {}
+    map_name = (
+        meta.get("map_name")
+        or meta.get("map_key")
+        or map_payload.get("name")
+        or map_payload.get("map_name")
+        or map_payload.get("key")
+        or map_payload.get("map_key")
+        or "N/A"
+    )
     lines = [
         f"Final result: {result_label(meta, frames)}",
         f"Final score: {fmt_number(score, ' / 100', 1)}",
-        f"Map: {meta.get('map_name') or meta.get('map_key') or 'N/A'}",
+        f"Map: {map_name}",
         f"Stage: {meta.get('stage_label') or meta.get('stage') or 'N/A'}",
         f"Elapsed: {fmt_number(stats.get('elapsed'), 's', 1)}",
         f"Distance: {fmt_number(stats.get('distance'), 'm', 1)}",
@@ -398,7 +450,7 @@ def render(
     path_points = [(x, y) for x, y, _ in states]
     slot = target_slot(frames)
     sim_context = load_sim_context(meta)
-    map_assets = sim_context.get("assets") if sim_context else None
+    map_assets = map_assets_from_payload(meta) or (sim_context.get("assets") if sim_context else None)
     stage_profile = sim_context.get("stage_profile") if sim_context else None
     if map_assets is not None:
         target_idx = meta.get("target_idx")
