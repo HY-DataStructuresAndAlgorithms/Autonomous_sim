@@ -1197,15 +1197,78 @@ class PlannerSkeleton:
         target_pose: Tuple[float, float, float],
         slot: Optional[List[float]] = None,
     ) -> float:
-        tx, ty, target_yaw = target_pose
+        tx, ty, _ = target_pose
         slot_open_sign = self._slot_open_side_from_lines(slot)
         if slot_open_sign is not None:
             return slot_open_sign
         open_signs = self._open_vertical_approach_signs(tx, ty)
-        yaw_sign = 1.0 if math.sin(target_yaw) >= 0.0 else -1.0
-        if yaw_sign in open_signs:
-            return yaw_sign
-        return open_signs[0] if open_signs else yaw_sign
+        return self._best_open_side_by_clearance(tx, ty, open_signs)
+
+    def _best_open_side_by_clearance(
+        self,
+        tx: float,
+        ty: float,
+        open_signs: List[float],
+    ) -> float:
+        signs = open_signs if open_signs else [1.0, -1.0]
+        scored = [
+            (self._open_side_clearance_score(tx, ty, sign), sign)
+            for sign in signs
+        ]
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return scored[0][1]
+
+    def _open_side_clearance_score(self, tx: float, ty: float, sign: float) -> float:
+        if self.map_extent is None:
+            return 0.0
+        _, _, ymin, ymax = self.map_extent
+        mid_y = 0.5 * (ymin + ymax)
+        yaw = math.pi / 2.0 if sign > 0.0 else -math.pi / 2.0
+        p3 = (tx, ty + sign * REAR_APPROACH_DISTANCE)
+        base_y = p3[1] + sign * REAR_Y_TRIANGLE_HEIGHT
+        raw_points = [
+            p3,
+            (tx - REAR_Y_TRIANGLE_HALF_WIDTH, base_y - sign * REAR_Y_POINT1_VERTICAL_PULL),
+            (tx + REAR_Y_TRIANGLE_HALF_WIDTH, base_y - sign * REAR_Y_POINT1_VERTICAL_PULL),
+        ]
+
+        score = 0.0
+        if self._vertical_approach_line_hits_wall(tx, ty, sign):
+            score -= 40.0
+        if ty < mid_y and sign > 0.0:
+            score += 4.0
+        elif ty > mid_y and sign < 0.0:
+            score += 4.0
+
+        for raw_x, raw_y in raw_points:
+            clamped_x, clamped_y = self._clamp_inside_map(
+                raw_x,
+                raw_y,
+                margin=0.2,
+                vehicle_margin=PARKING_VEHICLE_RECT_MARGIN,
+            )
+            clamp_error = math.hypot(clamped_x - raw_x, clamped_y - raw_y)
+            if clamp_error > 1e-6:
+                score -= 30.0 + 15.0 * clamp_error
+            if not self._inside_map(
+                clamped_x,
+                clamped_y,
+                margin=0.2,
+                vehicle_margin=PARKING_VEHICLE_RECT_MARGIN,
+            ):
+                score -= 25.0
+            clearance = self._estimate_pose_clearance(
+                clamped_x,
+                clamped_y,
+                yaw,
+                include_lines=True,
+                vehicle_margin=PARKING_VEHICLE_RECT_MARGIN,
+            )
+            if clearance <= 0.0:
+                score -= 50.0
+            else:
+                score += min(clearance, 4.0)
+        return score
 
     def _slot_open_side_from_lines(self, slot: Optional[List[float]]) -> Optional[float]:
         if slot is None:
