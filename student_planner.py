@@ -117,8 +117,10 @@ PRETURN_ROW_TARGETS = (
     (range(11, 16), 11),
     (range(22, 27), 22),
 )
-FRONT_UPPER_ROUTE_TARGETS = {21}
-FRONT_UPPER_ROUTE_X_OFFSET = 3.5
+FRONT_ROUTE_EARLY_X_OFFSET = 3.5
+FRONT_ROUTE_GOAL_Y_TOLERANCE = 2.0
+FRONT_ROUTE_LATE_PROGRESS = 0.75
+FRONT_ROUTE_MAX_LENGTH_RATIO = 1.20
 
 
 def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
@@ -291,10 +293,9 @@ class PlannerSkeleton:
                 f" maneuver={self.parking_maneuver}"
             )
 
-        grid_path = self._front_upper_route_path(
+        grid_path = self._avoid_late_turnaround_path(
             start=start,
             approach_pose=approach_pose,
-            slot=slot,
             original_path=grid_path,
         )
         simplified = self._simplify_path(grid_path, spacing=1.0)
@@ -1281,25 +1282,40 @@ class PlannerSkeleton:
         slot_l = abs(float(slot[3]) - float(slot[2]))
         return max(0.15, 0.05 * min(slot_w, slot_l))
 
-    def _front_upper_route_path(
+    def _avoid_late_turnaround_path(
         self,
         start: Tuple[float, float, float],
         approach_pose: Tuple[float, float, float],
-        slot: List[float],
         original_path: List[Tuple[float, float]],
     ) -> List[Tuple[float, float]]:
-        target_idx = self._target_slot_index(slot)
+        if not self.parking_mode.lower().startswith("front") or self.map_extent is None:
+            return original_path
+        sx, sy, syaw = start
+        ax, ay, _ = approach_pose
+        dx = ax - sx
+        dy = ay - sy
+        if abs(dx) < 12.0 or abs(dy) < 8.0 or len(original_path) < 5:
+            return original_path
+
+        first_goal_y_idx: Optional[int] = None
+        for idx, point in enumerate(original_path):
+            if abs(point[1] - ay) <= FRONT_ROUTE_GOAL_Y_TOLERANCE:
+                first_goal_y_idx = idx
+                break
+        if first_goal_y_idx is None:
+            return original_path
+
+        progress_when_y_reached = abs(original_path[first_goal_y_idx][0] - sx) / max(abs(dx), 1e-6)
+        path_fraction_when_y_reached = first_goal_y_idx / max(len(original_path) - 1, 1)
         if (
-            target_idx not in FRONT_UPPER_ROUTE_TARGETS
-            or not self.parking_mode.lower().startswith("front")
-            or self.map_extent is None
+            progress_when_y_reached < FRONT_ROUTE_LATE_PROGRESS
+            and path_fraction_when_y_reached < FRONT_ROUTE_LATE_PROGRESS
         ):
             return original_path
 
-        sx, sy, syaw = start
-        ax, ay, _ = approach_pose
+        direction_x = 1.0 if dx >= 0.0 else -1.0
         via = self._clamp_inside_map(
-            sx + FRONT_UPPER_ROUTE_X_OFFSET,
+            sx + direction_x * FRONT_ROUTE_EARLY_X_OFFSET,
             ay,
             margin=0.2,
             vehicle_margin=PARKING_VEHICLE_RECT_MARGIN,
@@ -1327,8 +1343,10 @@ class PlannerSkeleton:
         combined = first_leg[:-1] + second_leg
         if len(combined) < 3:
             return original_path
+        if self._path_length(combined) > self._path_length(original_path) * FRONT_ROUTE_MAX_LENGTH_RATIO:
+            return original_path
         print(
-            "[algo] T21 upper route inserted:"
+            "[algo] late-turn route adjusted:"
             f" via=({via[0]:.2f}, {via[1]:.2f})"
             f" original_points={len(original_path)}"
             f" routed_points={len(combined)}"
