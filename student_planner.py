@@ -692,8 +692,8 @@ class PlannerSkeleton:
             wheelbase=wheelbase,
             vehicle_margin=clearance_vehicle_margin,
         )
-        collision_risk = front_clearance < OBSTACLE_STOP_DISTANCE
-        if collision_risk and final_dist > 1.0:
+        collision_risk = front_clearance <= OBSTACLE_STOP_DISTANCE
+        if collision_risk:
             self._log_evaluation(
                 parking_success=False,
                 fail_reason="front_collision_risk",
