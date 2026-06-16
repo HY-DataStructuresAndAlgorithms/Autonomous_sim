@@ -117,6 +117,8 @@ PRETURN_ROW_TARGETS = (
     (range(11, 16), 11),
     (range(22, 27), 22),
 )
+FRONT_UPPER_ROUTE_TARGETS = {21}
+FRONT_UPPER_ROUTE_X_OFFSET = 3.5
 
 
 def pretty_print_map_summary(map_payload: Dict[str, Any]) -> None:
@@ -289,6 +291,12 @@ class PlannerSkeleton:
                 f" maneuver={self.parking_maneuver}"
             )
 
+        grid_path = self._front_upper_route_path(
+            start=start,
+            approach_pose=approach_pose,
+            slot=slot,
+            original_path=grid_path,
+        )
         simplified = self._simplify_path(grid_path, spacing=1.0)
         simplified = self._prepend_start_alignment(simplified, start)
         simplified = self._insert_row_preturn(
@@ -1272,6 +1280,60 @@ class PlannerSkeleton:
         slot_w = abs(float(slot[1]) - float(slot[0]))
         slot_l = abs(float(slot[3]) - float(slot[2]))
         return max(0.15, 0.05 * min(slot_w, slot_l))
+
+    def _front_upper_route_path(
+        self,
+        start: Tuple[float, float, float],
+        approach_pose: Tuple[float, float, float],
+        slot: List[float],
+        original_path: List[Tuple[float, float]],
+    ) -> List[Tuple[float, float]]:
+        target_idx = self._target_slot_index(slot)
+        if (
+            target_idx not in FRONT_UPPER_ROUTE_TARGETS
+            or not self.parking_mode.lower().startswith("front")
+            or self.map_extent is None
+        ):
+            return original_path
+
+        sx, sy, syaw = start
+        ax, ay, _ = approach_pose
+        via = self._clamp_inside_map(
+            sx + FRONT_UPPER_ROUTE_X_OFFSET,
+            ay,
+            margin=0.2,
+            vehicle_margin=PARKING_VEHICLE_RECT_MARGIN,
+        )
+        if math.hypot(via[0] - sx, via[1] - sy) < 1.0:
+            return original_path
+
+        first_leg = self._astar_path(
+            (sx, sy),
+            via,
+            start_yaw=syaw,
+            goal_yaw=None,
+        )
+        if not first_leg:
+            return original_path
+        second_leg = self._astar_path(
+            via,
+            (ax, ay),
+            start_yaw=None,
+            goal_yaw=None,
+        )
+        if not second_leg:
+            return original_path
+
+        combined = first_leg[:-1] + second_leg
+        if len(combined) < 3:
+            return original_path
+        print(
+            "[algo] T21 upper route inserted:"
+            f" via=({via[0]:.2f}, {via[1]:.2f})"
+            f" original_points={len(original_path)}"
+            f" routed_points={len(combined)}"
+        )
+        return combined
 
     def _insert_row_preturn(
         self,
