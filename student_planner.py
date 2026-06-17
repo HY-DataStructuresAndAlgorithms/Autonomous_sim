@@ -20,6 +20,7 @@ from __future__ import annotations
 import heapq
 import json
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -72,6 +73,8 @@ APPROACH_ON_PATH_MARGIN = 0.50
 APPROACH_PATH_DEVIATION_SPEED_DISTANCE = 1.20
 APPROACH_PREALIGN_DISTANCE = 4.0
 APPROACH_PREALIGN_MAX_BLEND = 0.45
+APPROACH_PREALIGN_YAW_OFFSET_DEG = 0.0
+APPROACH_PREALIGN_YAW_BLEND = 0.35
 APPROACH_STUCK_SECONDS = 3.0
 APPROACH_STUCK_MIN_DISTANCE = 2.0
 APPROACH_STUCK_FRONT_BLOCKED = 1.20
@@ -108,6 +111,30 @@ PARKING_MIN_ROLL_SPEED = 0.43
 SECOND_APPROACH_MIN_SPEED = 0.25
 PARKING_STRAIGHTEN_YAW_TOLERANCE = math.radians(1.5)
 PARKING_STRAIGHTEN_MIN_IOU = 0.75
+TUNABLE_POLICY_NAMES = {
+    "APPROACH_PREALIGN_YAW_OFFSET_DEG",
+    "APPROACH_PREALIGN_DISTANCE",
+    "APPROACH_PREALIGN_MAX_BLEND",
+    "APPROACH_PREALIGN_YAW_BLEND",
+    "REAR_APPROACH_DISTANCE",
+    "REAR_Y_TRIANGLE_HEIGHT",
+    "REAR_Y_TRIANGLE_HALF_WIDTH",
+    "REAR_Y_POINT2_EXTRA_WIDTH",
+    "REAR_Y_POINT1_VERTICAL_PULL",
+    "FIRST_APPROACH_EXTRA_Y_DISTANCE",
+    "REAR_ENTRY_DISTANCE",
+    "REAR_POINT3_REACHED_TOLERANCE",
+    "PARKING_MIN_ROLL_SPEED",
+    "SECOND_APPROACH_MIN_SPEED",
+    "REAR_REVERSE_SPEED",
+    "REAR_REVERSE_MIN_SPEED",
+    "PARKING_PREPARE_BRAKE",
+    "PARKING_FINAL_STOP_IOU",
+    "PARKING_FINAL_STOP_DISTANCE",
+    "PARKING_CENTER_STOP_DISTANCE",
+}
+PARKING_POLICY_CANDIDATES_CACHE: Optional[Dict[str, Dict[str, float]]] = None
+MIN_TUNED_POLICY_SCORE = 50.0
 PARKING_ORIENTATION_ALIGNMENT_THRESHOLD = math.cos(math.radians(48.0))
 BOTTOM_ROW_PRETURN_LEFT_OFFSET = 1.7
 BOTTOM_ROW_PRETURN_UP_OFFSET = 3.0
@@ -262,6 +289,7 @@ class PlannerSkeleton:
         self.target_signature = tuple(round(float(v), 3) for v in slot)
         target_pose = self._target_pose(slot)
         self.parking_maneuver = self._select_parking_maneuver(slot, target_pose)
+        self._apply_tuned_policy(slot)
         candidates = self._approach_candidates(slot, target_pose[2])
         best_plan = self._select_best_plan(
             (start[0], start[1]),
@@ -1214,6 +1242,101 @@ class PlannerSkeleton:
         limited = max(-max_steer, min(max_steer, limited))
         self.rear_last_steer = limited
         return limited
+
+    def _apply_tuned_policy(self, slot: List[float]) -> None:
+        group = self._policy_group_for_slot(slot)
+        policies = self._load_tuned_policy_candidates()
+        policy = policies.get(group)
+        if not policy:
+            return
+        applied: Dict[str, float] = {}
+        for name, value in policy.items():
+            if name not in TUNABLE_POLICY_NAMES:
+                continue
+            try:
+                globals()[name] = float(value)
+                applied[name] = float(value)
+            except (TypeError, ValueError):
+                continue
+        if applied:
+            print(
+                "[algo] tuned parking policy applied:"
+                f" group={group}"
+                f" policy={json.dumps(applied, sort_keys=True)}"
+            )
+
+    def _policy_group_for_slot(self, slot: List[float]) -> str:
+        row = self._target_row_number(slot)
+        row_group = "upper" if row == 3 else "lower"
+        maneuver_group = "rear_in" if self.parking_maneuver.lower().startswith("rear") else "front_in"
+        return f"{row_group}_{maneuver_group}"
+
+    def _target_row_number(self, slot: List[float]) -> int:
+        if len(slot) != 4 or not self.map_data:
+            return 1
+        slots = self.map_data.get("slots") or []
+        if not slots:
+            return 1
+        centers = sorted(
+            {
+                round(0.5 * (float(candidate[2]) + float(candidate[3])), 2)
+                for candidate in slots
+                if len(candidate) == 4
+            }
+        )
+        if not centers:
+            return 1
+        target_y = round(0.5 * (float(slot[2]) + float(slot[3])), 2)
+        closest_idx = min(range(len(centers)), key=lambda idx: abs(centers[idx] - target_y))
+        return closest_idx + 1
+
+    def _load_tuned_policy_candidates(self) -> Dict[str, Dict[str, float]]:
+        global PARKING_POLICY_CANDIDATES_CACHE
+        if os.environ.get("PARKING_DISABLE_TUNED_POLICY") == "1":
+            return {}
+        if PARKING_POLICY_CANDIDATES_CACHE is not None:
+            return PARKING_POLICY_CANDIDATES_CACHE
+        candidates: Dict[str, Dict[str, float]] = {}
+        search_paths = [
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), "parking_policy_candidates.json"),
+            os.path.join(os.getcwd(), "parking_policy_candidates.json"),
+        ]
+        for path in search_paths:
+            try:
+                with open(path, "r", encoding="utf-8") as fp:
+                    payload = json.load(fp)
+            except OSError:
+                continue
+            raw_candidates = payload.get("policy_candidates", {})
+            if not isinstance(raw_candidates, dict):
+                continue
+            for group, item in raw_candidates.items():
+                if not isinstance(item, dict):
+                    continue
+                result = str(item.get("result") or "").lower()
+                try:
+                    score = float(item.get("score") or 0.0)
+                except (TypeError, ValueError):
+                    score = 0.0
+                if result != "success" or score < MIN_TUNED_POLICY_SCORE:
+                    continue
+                policy = item.get("policy", item)
+                if not isinstance(policy, dict):
+                    continue
+                filtered: Dict[str, float] = {}
+                for name, value in policy.items():
+                    if name not in TUNABLE_POLICY_NAMES:
+                        continue
+                    try:
+                        filtered[name] = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                if filtered:
+                    candidates[str(group)] = filtered
+            if candidates:
+                break
+        PARKING_POLICY_CANDIDATES_CACHE = candidates
+        return candidates
 
     def _target_pose(self, slot: List[float]) -> Tuple[float, float, float]:
         cx, cy = self._slot_center(slot)
@@ -2269,6 +2392,12 @@ class PlannerSkeleton:
             max_steer=max_steer,
             reverse=False,
         )
+        target_yaw = math.atan2(target[1] - y, target[0] - x)
+        target_yaw += math.radians(APPROACH_PREALIGN_YAW_OFFSET_DEG)
+        yaw_error = self._wrap_to_pi(target_yaw - yaw)
+        yaw_steer = max(-max_steer, min(max_steer, 0.75 * yaw_error))
+        yaw_blend = max(0.0, min(1.0, APPROACH_PREALIGN_YAW_BLEND))
+        prealign_steer = (1.0 - yaw_blend) * prealign_steer + yaw_blend * yaw_steer
         progress = 1.0 - max(0.0, approach_remaining) / max(
             APPROACH_PREALIGN_DISTANCE,
             1e-6,
