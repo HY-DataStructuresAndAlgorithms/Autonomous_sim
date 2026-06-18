@@ -22,6 +22,8 @@ cd J:\work\Self-Parking\self-parking-user-algorithms
 }
 ```
 
+simulator의 IPC controller는 기본 timeout을 `0.15초`로 둔다. 학생 알고리즘이 연결된 뒤 명령을 너무 늦게 보내면 simulator는 통신 실패로 보고 연결을 reset한다. 이 제한 때문에 초기 map 수신 직후 너무 많은 후보 경로를 한 번에 계산하거나, 무거운 planning을 수행하는 방식은 사용하기 어려웠다. 최종 구현에서는 1차 A* 경로 후보 수와 탐색 시간을 제한하고, 주차 후반부 계산은 필요한 시점에 가볍게 수행하도록 구성했다.
+
 ## 주요 파일
 
 - `student_planner.py`: 실제 주차 알고리즘 구현
@@ -62,6 +64,39 @@ A* cost는 단순 최단거리만 보지 않는다. 경로 계획에서는 hard 
 - Soft penalty: 주차 라인에 너무 가까운 위치, 장애물과의 여유 거리가 작은 위치, 급격한 방향 변화, 불필요하게 긴 경로는 cost를 증가시킨다. 완전히 막지는 않지만, 같은 목적지라면 더 안전하고 부드러운 경로가 선택되도록 한다.
 
 이 방식으로 경로가 짧더라도 벽이나 라인에 너무 붙는 경우를 줄이고, 차량이 실제로 따라갈 수 있는 경로를 우선적으로 선택하도록 했다.
+
+1차 approach 후보를 고를 때는 A*로 얻은 경로 길이와 목표 슬롯에 대한 정렬 상태를 함께 본다. 후보별 점수는 다음 식에 가깝게 계산한다.
+
+```text
+approach_cost =
+    path_length
+    + 0.65 * final_leg_distance
+    + 2.5 * lateral_error
+    + 8.0 / max(clearance, 0.20)
+```
+
+- `path_length`: 현재 위치에서 approach point까지의 A* 경로 길이
+- `final_leg_distance`: approach point에서 목표 슬롯 중심까지 남은 거리
+- `lateral_error`: 목표 yaw 기준 중심선에서 옆으로 벗어난 정도
+- `clearance`: approach point 주변 장애물 여유 거리
+
+A* 내부의 한 step cost는 다음 항목으로 구성된다.
+
+```text
+step_cost =
+    move_cost
+    + 0.55 * abs(turn)
+    + 0.05 * heading_distance_to_goal
+    + line_penalty
+```
+
+그리고 priority queue에서는 아래 값을 기준으로 낮은 노드를 먼저 탐색한다.
+
+```text
+priority = accumulated_cost + 1.45 * heuristic_distance
+```
+
+이렇게 해서 짧은 경로뿐 아니라, 조향 변화가 적고 라인에 너무 붙지 않는 경로가 선택되도록 했다.
 
 ### 3. 주차 모드
 
@@ -118,6 +153,24 @@ A* approach path 생성 파라미터는 강화학습에서 제외했다. 해당 
 - 최종 위치 오차가 클수록 패널티
 - gear switch가 많을수록 패널티
 - steering reversal이 많을수록 패널티
+
+실제 reward 계산식은 다음과 같다.
+
+```text
+reward =
+    score
+    + 70.0 * parking_iou
+    + 10.0  if orientation_match
+    + 6.0   if parking_iou >= success_iou and final_speed <= 0.2
+    + 20.0  if success
+    - 35.0  if collision
+    - 20.0  if timeout
+    - 1.2 * final_position_error
+    - 0.8 * gear_switches
+    - 0.4 * steering_reversals
+```
+
+여기서 `score`는 simulator가 계산한 실제 점수다. 강화학습은 이 점수를 직접 높이는 것뿐 아니라, IoU, orientation, 정지 상태, 기어 변경 수, 조향 반전 수를 함께 고려하도록 했다.
 
 학습 결과가 항상 좋아지는 것은 아니었기 때문에, 안전장치를 두었다. 학습된 policy는 성공했고 score가 90점을 초과한 경우에만 학생 알고리즘에 적용된다. 그 이하의 결과는 저장되어 있어도 실제 주행에서는 무시된다.
 
