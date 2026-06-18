@@ -122,7 +122,7 @@ TUNABLE_POLICY_NAMES = {
     "PARKING_CENTER_STOP_DISTANCE",
 }
 PARKING_POLICY_CANDIDATES_CACHE: Optional[Dict[str, Dict[str, float]]] = None
-MIN_TUNED_POLICY_SCORE = 85.0
+MIN_TUNED_POLICY_SCORE = 90.0
 PARKING_ORIENTATION_ALIGNMENT_THRESHOLD = math.cos(math.radians(48.0))
 BOTTOM_ROW_PRETURN_LEFT_OFFSET = 1.7
 BOTTOM_ROW_PRETURN_UP_OFFSET = 3.0
@@ -1172,9 +1172,7 @@ class PlannerSkeleton:
             vehicle_margin=PARKING_VEHICLE_RECT_MARGIN,
         )
         target_speed = REAR_REVERSE_FINAL_SPEED if final_dist < 1.4 else REAR_REVERSE_SPEED
-        target_speed = max(target_speed, REAR_REVERSE_MIN_SPEED)
-        if point3_reached:
-            target_speed = max(target_speed, PARKING_MIN_ROLL_SPEED)
+        target_speed = max(target_speed, REAR_REVERSE_MIN_SPEED, PARKING_MIN_ROLL_SPEED)
         if reverse_clearance < PARKING_REVERSE_STOP_CLEARANCE:
             target_speed = 0.0
         accel, brake = self._speed_command(
@@ -1306,7 +1304,7 @@ class PlannerSkeleton:
                     score = float(item.get("score") or 0.0)
                 except (TypeError, ValueError):
                     score = 0.0
-                if result != "success" or score < MIN_TUNED_POLICY_SCORE:
+                if result != "success" or score <= MIN_TUNED_POLICY_SCORE:
                     continue
                 policy = item.get("policy", item)
                 if not isinstance(policy, dict):
